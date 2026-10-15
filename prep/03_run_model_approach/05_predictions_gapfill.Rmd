@@ -27,6 +27,8 @@ library(ranger)
 library(randomForest)
 library(parallel)
 library(data.table)
+library(dplyr)
+library(tidyr)
 
 
 source(here("R/dir.R"))
@@ -45,7 +47,11 @@ gfi_df <- read.csv(here("data/model_features/global_fishing_index_governance.csv
   
 # Load prepared data
 model_data <- readRDS(here("data/model_features/prepared_data_1deg.rds")) %>%
-  mutate(year = as.numeric(year)) # i think we need to adjust the prepared data to include cells which have no fishing effort in them. We can do this in the loop below? 
+  mutate(year = as.numeric(year)) %>% 
+       mutate(length_category = factor(length_category,
+                                  levels = c("Less than 6m", "6-12m", "12-24m", "24-50m", "Over 50m"),          # your classes, smallest to largest
+                                  ordered = TRUE),
+          gear            = factor(gear))
 
 ## read in environmental variables
 
@@ -95,7 +101,16 @@ model_data <- readRDS(here("data/model_features/prepared_data_1deg.rds")) %>%
         mutate(gov_score = ifelse(eez_id < 99999 & is.na(gov_score), "no_data", gov_score)) %>%
     dplyr::select(-eez_sovereign, -nearest_seamount_id) %>% 
     distinct()  %>%
-    dplyr::select(-geometry_wkt)
+    dplyr::select(-geometry_wkt) %>%
+             mutate(
+    eez_id  = factor(eez_id),
+    fao_id  = factor(fao_id),
+    meso_id = factor(meso_id),
+     eez_region_world_bank_7 = factor(eez_region_world_bank_7),
+       ocean     = factor(ocean),
+    # ordinal: keep the score order; sentinels sit at the low end so one split isolates them
+    gov_score = factor(gov_score, levels = c("no_data", "high_seas", as.character(0:10)), ordered = TRUE)
+  )
 
 mollweide_projection <- "+proj=moll +lon_0=0 +x_0=0 +y_0=0 +ellps=WGS84 +units=m +no_defs"
 
@@ -190,7 +205,12 @@ rousseau_fix <- rousseau_regions %>%
       flag_fin == "RAA" ~ "Azores",
       flag_fin == "RAM" ~ "Madeira",
       TRUE ~ flag_country_name
-    ))
+    )) %>% 
+           mutate(length_category = factor(length_category,
+                                  levels = c("Less than 6m", "6-12m", "12-24m", "24-50m", "Over 50m"),          # your classes, smallest to largest
+                                  ordered = TRUE),
+          gear            = factor(gear))
+  
   test <- hist_fish_data %>% filter(is.na(flag_country_name))
 
   
@@ -214,11 +234,13 @@ eez_lookup <- read.csv(here("data/model_features/deg_1_x_1/eez/eez_lookup_fix.cs
     eez_sovereign == "RAM" ~ "Madeira",
     TRUE ~ eez_country_name
   )) %>%
-  mutate(eez_country_name = ifelse(is.na(eez_country_name), "High seas", eez_country_name))
+  mutate(eez_country_name = ifelse(is.na(eez_country_name), "High seas", eez_country_name)) %>%
+  mutate(eez_id = as.factor(eez_id))
 
 fao_lookup <- read.csv(here("data/model_features/deg_1_x_1/fao/fao_major_ids.csv")) %>%
   clean_names() %>%
-  dplyr::select(fao_id, "fao_major_fishing_area" = "name_en")
+  dplyr::select(fao_id, "fao_major_fishing_area" = "name_en") %>%
+  mutate(fao_id = as.factor(fao_id))
 
 global_grid <- read.csv(here("data/model_features/deg_1_x_1/global_grid.csv")) %>%
   dplyr::select(lon, lat, pixel_id)
@@ -233,8 +255,12 @@ env_grid_fishing_areas <- env_data_fishing_areas %>%
 
 # load access data 
 access_data_loop <- qs::qread(here("data/int/prediction_historical_data/catch_fishing_access.qs")) %>%
-  distinct()
-access_data_high_seas_loop <- qs::qread(here("data/int/prediction_historical_data/catch_fishing_access_high_seas.qs"))
+  distinct() %>%
+  mutate(eez_id = as.factor(eez_id))
+access_data_high_seas_loop <- qs::qread(here("data/int/prediction_historical_data/catch_fishing_access_high_seas.qs")) %>%
+    mutate(
+           fao_id = as.factor(fao_id))
+
 
 test <- access_data_loop %>% 
   filter(year == 2017, 
@@ -248,9 +274,9 @@ First lets check to see what predictions need to be gapfilled. We'll do this by 
 
  modelled_flags_original <- str_before_first(str_after_last(list.files(file.path(rdsi_dir, "prep/random_forest/predictions_industrial_flag_revised_floor_0/"), pattern = ".qs", full.names = TRUE), "_"), "\\.qs")
 
-  all_files_flag <- list.files(file.path(rdsi_dir, "prep/random_forest/predictions_industrial_flag_revised_floor_0/"), full.names = TRUE)
+  all_files_flag <- list.files(file.path(rdsi_dir, "prep/random_forest/predictions_industrial_flag_revised_floor_depth/"), full.names = TRUE)
 
-    all_data <- lapply(all_files_flag[-148], qread) %>%
+    all_data <- lapply(all_files_flag[-133], qread) %>%
       bind_rows()
 
 all_data_grouped_2 <- all_data %>% 
@@ -305,7 +331,7 @@ regions_missing_df <- hist_fish_data %>%
 regions_missing <- hist_fish_data %>% 
   filter(flag_fin %in% c(flags_missing)) %>%
   pull(region) %>%
-  unique() # ok only 7 regions missing, so that's good 
+  unique() # ok only 6 regions missing, so that's good 
   
 
 years_missing <- unique(missing_data$year) # all years missing, because of DOM for example
@@ -334,7 +360,7 @@ old_missing <- c(
   "MNE", "ROU", "SUR", "SVN", "TON"
 )
 
-setdiff(flags_missing_fin, old_missing) # 0, ok we dont need to rerun then 
+setdiff(flags_missing_fin, old_missing) # HND, BLZ, we will rerun 
 
 test <- hist_fish_data %>%
   filter(flag_fin %in% c(flags_missing_fin)) %>%
@@ -361,227 +387,229 @@ After the models are fit, we make predictions on ALL DATA. So stage 1 is in samp
 
 ```{r}
 
-years <- c(1950:2017)
+years   <- 1950:2017
+out_dir <- file.path(rdsi_dir, "prep/random_forest/predictions_regional/yearly")
+s1_dir  <- file.path(rdsi_dir, "prep/random_forest/stage_1_models_regional")
+s2_dir  <- file.path(rdsi_dir, "prep/random_forest/stage_2_models_regional")
 
-## read each model into a list upfront:
+n_workers <- 4
+n_threads <- max(1, floor(parallel::detectCores() / n_workers))  # ranger threads per worker
 
-regions_missing_string <- paste0(regions_missing, collapse = "|")
+## Safety checks:
+## - dist_eez is joined once per flag, so it must not vary by year
+## - env data must not contribute columns the lookup tables join on (env is joined last)
+env_only    <- setdiff(names(env_data_fishing_areas), c("lon", "lat", "year", "pixel_id"))
+lookup_cols <- unique(c(names(access_data_loop), names(access_data_high_seas_loop),
+                        names(reach), names(dist_eez)))
+stopifnot(!"year" %in% names(dist_eez))
 
-flags_finished <- unique(str_after_last(str_before_last(list.files(file.path(rdsi_dir, "prep/random_forest/predictions_regional/yearly/")), "_"), "_"))
-  
-flags_to_run <- sort(setdiff(flags_missing_fin, flags_finished))
+## Spatial columns that live in the env data but are needed for the lookup joins
+## (e.g. eez_sovereign). Take them once per cell and attach them to the grid.
+env_spatial_cols <- intersect(env_only, c(lookup_cols, "eez_sovereign"))
 
+env_static <- env_data_fishing_areas %>%
+  distinct(lon, lat, across(all_of(env_spatial_cols)))
 
-cl <- parallel::makeCluster(4)
+# these must be constant across years for each cell, otherwise they can't be joined once
+stopifnot(nrow(env_static) == nrow(distinct(env_static, lon, lat)))
+
+grid_with_spatial <- env_grid_fishing_areas %>%
+  left_join(env_static, by = c("lon", "lat"))
+
+reach_keys <- intersect(names(reach), c("flag_fin", "gear", "length_category"))
+
+## Split big tables once so each iteration grabs its slice directly
+env_by_year  <- split(env_data_fishing_areas, env_data_fishing_areas$year)
+hist_by_flag <- split(hist_fish_data, hist_fish_data$flag_fin)
+
+read_model <- function(dir, stage, region) {
+  f <- list.files(dir, pattern = glue("stage_{stage}_rf_model_full_data_{region}_.*\\.qs$"),
+                  full.names = TRUE)
+  if (length(f) == 0) stop("No stage ", stage, " model found for region: ", region)
+  qs::qread(f[1])
+}
+
+flags_finished <- unique(sub("^model_preds_(.+)_\\d{4}\\.qs$", "\\1",
+                             list.files(out_dir, pattern = "^model_preds_.*\\.qs$")))
+flags_to_run   <- sort(setdiff(flags_missing_fin, flags_finished))
+
+## Fork cluster: workers share the parent's memory instead of each getting serialized copies
+cl <- parallel::makeForkCluster(n_workers)
 doParallel::registerDoParallel(cl)
-  
- foreach(flag = flags_to_run, .packages = c("dplyr", "tidyverse", "randomForest", "qs", "glue", "ranger")) %dopar% {
-    #  flag = "GAB"
-   
-   regional_name <- hist_fish_data %>%
-     filter(flag_fin == flag) %>%
-     pull(region) %>%
-     unique()
-   
-   if(flag == "STP"){
-     regional_name = "SubAfrica"
-   }
-   
-   #### Read in models 
-   # read in stage 2 model! 
-# Get the list of matching files
-matching_files <- list.files(
-  path = file.path(rdsi_dir, "prep/random_forest/stage_2_models_regional/"), 
-  pattern = glue::glue("stage_2_rf_model_full_data_{regional_name}_.*\\.qs$"),
-  full.names = TRUE
-)
 
-# Check if a matching file exists
-if (length(matching_files) > 0) {
-  stage2_model <- qs::qread(matching_files[1])  # Read the first matching file
-}   else{
-  stop("No matching file found for flag: ", flag)
-}
+res <- foreach(flag = flags_to_run, .errorhandling = "pass", .inorder = FALSE) %dopar% {
 
-## read in stage 1 model! 
-# Get the list of matching files
-matching_files <- list.files(
-  path = file.path(rdsi_dir, "prep/random_forest/stage_1_models_regional/"), 
-  pattern = glue::glue("stage_1_rf_model_full_data_{regional_name}_.*\\.qs$"),
-  full.names = TRUE
-)
+  # flag = "CUB"
+  hist_flag <- hist_by_flag[[flag]]
 
-# Check if a matching file exists
-if (length(matching_files) > 0) {
-  stage1_model <- qs::qread(matching_files[1])  # Read the first matching file
-}    else {
-  stop("No matching file found for flag: ", flag)
-}
+  regional_name <- if (flag == "STP") "SubAfrica" else unique(hist_flag$region)
 
- for(yr in years) {
-# yr = 2016
+  stage2_model <- read_model(s2_dir, 2, regional_name)
+  stage1_model <- read_model(s1_dir, 1, regional_name)
+
+  cats_by_year <- distinct(hist_flag, year, flag_fin, gear, length_category)
+
+  ## Largest radius any year allows per category -> loose spatial pre-filter
+  max_radius <- reach %>%
+    filter(!is.na(radius_km_med)) %>%
+    { if ("flag_fin" %in% names(.)) filter(., flag_fin == flag) else . } %>%
+    group_by(across(all_of(reach_keys))) %>%
+    summarise(max_radius = max(radius_km_med), .groups = "drop")
+
+  ## Year-invariant grid: built once per flag
+ static_grid <- tidyr::crossing(grid_with_spatial,
+                                 distinct(cats_by_year, flag_fin, gear, length_category)) %>%
+    dplyr::select(-any_of("pixel_id")) %>%
+    left_join(dist_eez) %>%
+    inner_join(max_radius, by = reach_keys) %>%
+    filter(dist_km <= max_radius) %>%        # loose pre-filter; exact per-year filter below
+    dplyr::select(-max_radius)
+
+  for (yr in years) {
     
-# get combination of categories we need to run through our models
-model_data_flag <- hist_fish_data %>%
-  dplyr::select(flag_fin, gear, length_category, year, total_nominal_fishing_hours, region) %>%
-  filter(flag_fin == flag, year == yr)
+    # yr = 2017
 
-distinct_cats <- model_data_flag %>%
-    distinct(flag_fin, gear, length_category) 
+    out_file <- file.path(out_dir, glue("model_preds_{flag}_{yr}.qs"))
+    # test <- qread(out_file)
+    if (file.exists(out_file)) next
 
-full_data <- tidyr::crossing(env_grid_fishing_areas, distinct_cats) %>%
-  mutate(year = yr) %>%
-  left_join(env_data_fishing_areas, by = c("lon", "lat", "year")) %>%
-  dplyr::select(-pixel_id) %>% 
-  left_join(access_data_loop) %>%
-  left_join(access_data_high_seas_loop) %>%
-  mutate(access = ifelse(is.na(access), 0, access),
-    access_fao = ifelse(is.na(access_fao), 0, access_fao)) %>% # only allow fishing where Watson says they can fish
-  mutate(access = ifelse(eez_sovereign == flag, 1, access)) %>% # always allow a country to fish in its own EEZ
-  mutate(access_fin = ifelse(eez_sovereign == "High seas", access_fao, access)) %>%
-  filter(access_fin == 1)  %>% # filter for areas where this flag actually has access to fishing
-  left_join(reach) %>%
-  left_join(dist_eez) %>%
-  filter(dist_km <= radius_km_med)
+    env_yr  <- env_by_year[[as.character(yr)]]
+    cats_yr <- filter(cats_by_year, year == yr)
+    if (is.null(env_yr) || nrow(cats_yr) == 0) next
 
-if(nrow(full_data) == 0){
-    cat("skipping", flag, yr, "check to make sure this is right")
-  next()
-}
+    full_data <- static_grid %>%
+      semi_join(cats_yr, by = c("flag_fin", "gear", "length_category")) %>%
+      mutate(year = yr) %>%
+      left_join(access_data_loop) %>%
+      left_join(access_data_high_seas_loop) %>%
+      mutate(access     = ifelse(is.na(access), 0, access),
+             access_fao = ifelse(is.na(access_fao), 0, access_fao),
+             access     = ifelse(eez_sovereign == flag, 1, access),   # always allow fishing in own EEZ
+             access_fin = ifelse(eez_sovereign == "High seas", access_fao, access)) %>%
+      filter(access_fin == 1) %>%              # only where this flag has access
+      left_join(reach) %>%
+      filter(dist_km <= radius_km_med) %>%     # exact radius for this year
+      inner_join(dplyr::select(env_yr, -any_of(c("pixel_id", env_spatial_cols))),
+                 by = c("lon", "lat", "year"))
 
-oos_preds <- full_data %>%
-  mutate(pred_prop = predict(stage2_model, data = .)$predictions, num.threads = 1)
+    if (nrow(full_data) == 0) {
+      cat("skipping", flag, yr, "check to make sure this is right\n")
+      next
+    }
 
+    ## Both stages predicted on the same rows -> plain columns, no join needed
+    full_data$pred_prop <- predict(stage2_model, data = full_data, num.threads = n_threads)$predictions
+    p1 <- predict(stage1_model, data = full_data, num.threads = n_threads)$predictions[, "1"]
 
-## make stage 1 predictions and apply fishing access filter 
-stage_1_preds_rescale <- full_data %>%
-  mutate(pred_presence = predict(stage1_model, data = .)$predictions[, "1"], num.threads = 1) %>%
-  mutate(pred_presence = ifelse(is.na(pred_presence), 0, pred_presence)) %>%
-  mutate(pred_presence_access = access_fin*pred_presence) %>%
-    mutate(pred_presence_rescale = ifelse(pred_presence_access > 0, 1, 0)) 
+    full_data <- full_data %>%
+      mutate(pred_presence         = ifelse(is.na(p1), 0, p1),
+             pred_presence_rescale = ifelse(access_fin * pred_presence > 0, 1, 0))  # any prediction > 0 = presence
 
-if(flag == "RAA" & yr %in% c(2015:2016)){ # for some reason 2016 and 2017 are throwing no predictions for Azores...
-  
-  stage_1_preds_rescale <- stage_1_preds_rescale %>%
-    mutate(pred_presence_rescale = ifelse(eez_sovereign == "RAA", 1, pred_presence_rescale))
-  
-} 
+    if (flag == "RAA" && yr %in% 2015:2016) {  # Azores throws no predictions for these years
+      full_data <- full_data %>%
+        mutate(pred_presence_rescale = ifelse(eez_sovereign == "RAA", 1, pred_presence_rescale))
+    }
 
-   # make any predictions > 0 to be presence = 1, even if less than 0.5. This should work in almost all cases, but if it doesn't, then we apply the below methods:
+    full_data$pred_presence_gf <- full_data$pred_presence_rescale
+    cat_keys <- c("flag_fin", "gear", "length_category")
 
-#### Now fill any remaining gaps (should be very rare) by using the same predictions per gear or length category
-  # NOTE July 14; I don't think we need this any longer, but will keep in just in case. 
-## We predict fishing presence probabilities for each combination of flag state, gear type, and vessel length category using the stage-one model. Following this, we applied a rescaling step to convert predicted probabilities to binary presence–absence, incorporating additional assumptions to account for potential fishing within national EEZs, including cases where predicted probabilities were low but domestic fishing activity was expected. To account for potential underprediction of fishing presence in specific flag–gear–length category combinations where no presence was predicted, but there is effort reported, we applied a hierarchical gap-filling procedure based on broader gear-level patterns within the flag country's fishing fleet. In cases where all predicted presence values for a given flag–gear–length category combination were zero, but other length categories within the same flag–gear combination exhibited predicted presence, we reassigned the presence predictions from the flag-gear combination with the most predictions to the all-zero category. This approach assumes that when fishing is predicted for a given gear type and flag state, similar spatial patterns are likely for other vessel size classes using the same gear, even if direct predictions were absent. If there were still flag-gear-length combinations with no predicted presence, we appleid the same approach, but focusing on length categories, rather than gear. That is, we assume that when fishing is predicted for a given vessel length and flag state, similar spatial patters are liekly for other vessel sizes, regardless of gear type. 
-  
+    #### Gap-fill step 1 (by gear) -- only if some flag/gear/length combo has zero predictions
+    n_preds_df <- full_data %>%
+      group_by(across(all_of(cat_keys))) %>%
+      summarise(n_preds = sum(pred_presence_rescale > 0), .groups = "drop")
 
-# Summarize max presence by length category
-n_preds_df <- stage_1_preds_rescale %>%
-  dplyr::group_by(flag_fin, gear, length_category) %>%
-  summarise(
-    n_preds = sum(pred_presence_rescale > 0),
-    .groups = "drop"
-  ) %>%
-  ungroup()
+    if (any(n_preds_df$n_preds == 0)) {
 
-best_lc <- stage_1_preds_rescale %>%
-  group_by(flag_fin, gear, length_category) %>%
-  summarise(
-    n_preds = sum(pred_presence_rescale > 0),
-    .groups = "drop"
-  ) %>%
-  group_by(flag_fin, gear) %>%
-  slice_max(order_by = n_preds, n = 1, with_ties = FALSE) %>%
-  rename(best_length_category = length_category)
+      best_lc <- n_preds_df %>%
+        group_by(flag_fin, gear) %>%
+        slice_max(n_preds, n = 1, with_ties = FALSE) %>%
+        ungroup() %>%
+        dplyr::select(flag_fin, gear, length_category)
 
-preds_for_gf <- stage_1_preds_rescale %>%
-  group_by(lon, lat, flag_fin, gear) %>%
-    mutate(
-         max_pred_gear_rescale = max(pred_presence_rescale, na.rm = TRUE)) %>%
-  ungroup() %>%
-  left_join(best_lc) %>%
-  filter(length_category == best_length_category) %>% # select the length category with the most predictions to use for gapfilling
-  dplyr::select(lon, lat, flag_fin, gear, max_pred_gear_rescale)
+      # max presence across length categories per cell/gear, kept only for cells where the best length category is present
+      gear_fill <- full_data %>%
+        group_by(lon, lat, flag_fin, gear) %>%
+        summarise(max_fill = max(pred_presence_rescale), .groups = "drop") %>%
+        semi_join(semi_join(full_data, best_lc, by = cat_keys),
+                  by = c("lon", "lat", "flag_fin", "gear"))
 
-stage_1_preds_gf <- stage_1_preds_rescale %>%
-  dplyr::select(lon, lat, flag_fin, gear, length_category, year, fao_id, eez_id, eez_sovereign, pred_presence, pred_presence_rescale) %>%
-  left_join(preds_for_gf) %>%
-  left_join(n_preds_df) %>%
-  mutate(
-    pred_presence_gf = case_when(
-      pred_presence_rescale == 0 & max_pred_gear_rescale > 0 & n_preds == 0 ~ max_pred_gear_rescale, # only gapfill if there are no predictions at all in this gear/vessel type
-      TRUE ~ pred_presence_rescale
-    )
-  )
+      full_data <- full_data %>%
+        left_join(gear_fill, by = c("lon", "lat", "flag_fin", "gear")) %>%
+        left_join(n_preds_df, by = cat_keys) %>%
+        mutate(pred_presence_gf = case_when(
+          pred_presence_rescale == 0 & max_fill > 0 & n_preds == 0 ~ max_fill,
+          TRUE ~ pred_presence_rescale)) %>%
+        dplyr::select(-max_fill, -n_preds)
 
-## now we need to fill in any that weren't filled in before by gapfilling based on length instead of gear
-n_preds_df <- stage_1_preds_gf %>%
-  group_by(flag_fin, gear, length_category) %>%
-  summarize(
-    n_preds = sum(pred_presence_gf > 0),
-    .groups = "drop"
-  ) %>%
-  ungroup()
+      #### Gap-fill step 2 (by length category) -- only if zeros remain
+      n_preds_df2 <- full_data %>%
+        group_by(across(all_of(cat_keys))) %>%
+        summarise(n_preds = sum(pred_presence_gf > 0), .groups = "drop")
 
-best_lc <- stage_1_preds_gf %>%
-  group_by(flag_fin, gear, length_category) %>%
-  summarize(
-    n_preds = sum(pred_presence_gf > 0),
-    .groups = "drop"
-  ) %>%
-  group_by(flag_fin, length_category) %>%
-  mutate(max_n_preds = max(n_preds)) %>%
-  ungroup() %>%
-  filter(n_preds == max_n_preds) %>%
-  rename(best_length_category = length_category,
-         best_gear_cat = gear) %>%
-  dplyr::select(-max_n_preds)
+      if (any(n_preds_df2$n_preds == 0)) {
 
-preds_for_gf <- stage_1_preds_gf %>%
-    right_join(best_lc) %>%
-  group_by(lon, lat, flag_fin, length_category) %>%
-    summarise(
-         max_pred_gear_rescale = max(pred_presence_gf, na.rm = TRUE)) %>%
-  ungroup()
+        best_gear <- n_preds_df2 %>%
+          group_by(flag_fin, length_category) %>%
+          filter(n_preds == max(n_preds)) %>%
+          ungroup() %>%
+          dplyr::select(all_of(cat_keys))
 
-stage_1_preds_gf_2 <- stage_1_preds_gf %>%
-  dplyr::select(lon, lat, flag_fin, gear, length_category, year, fao_id, eez_id, eez_sovereign, pred_presence, pred_presence_rescale,
-                pred_presence_gf) %>%
-  left_join(preds_for_gf) %>%
-  left_join(n_preds_df) %>%
-  mutate(
-    pred_presence_gf = case_when(
-      pred_presence_gf == 0 & max_pred_gear_rescale > 0 & n_preds == 0 ~ max_pred_gear_rescale, # only gapfill if there are no predictions at all in this gear/vessel type
-      TRUE ~ pred_presence_gf
-    )
-  )
+        lc_fill <- full_data %>%
+          semi_join(best_gear, by = cat_keys) %>%
+          group_by(lon, lat, flag_fin, length_category) %>%
+          summarise(max_fill = max(pred_presence_gf), .groups = "drop")
 
-## join stage 1 and 2 preds together and multiply 
-all_preds <- oos_preds %>%
-    # dplyr::select(lon, lat, flag_fin,gear, length_category, year, fao_id, eez_id, eez_sovereign, pred_prop) %>% 
-   # left_join(., stage_1_preds_rescale) %>% 
-     left_join(., stage_1_preds_gf_2) %>% 
-   dplyr::select(lon, lat, flag_fin,gear, length_category, year, fao_id, eez_id, eez_sovereign, pred_prop, pred_presence_gf) %>% 
-  mutate(pred_prop_final = pred_prop*pred_presence_gf) %>%
-  filter(pred_prop_final > 0) %>%
-  filter(!is.na(pred_prop_final)) %>%
- group_by(year, flag_fin, gear, length_category) %>%
-  mutate(prop_fishing_hours_cell_predict_rescaled = pred_prop_final / sum(pred_prop_final, na.rm = TRUE)) %>%
- ungroup() %>% # need to rescale the predictions to be between 0 and 1 here so that we can allocate effort
-  mutate(year = yr) %>%
-  left_join(hist_fish_data) %>%
-  mutate(nom_active_fishing_hours = prop_fishing_hours_cell_predict_rescaled*total_nominal_fishing_hours,
-         eff_active_fishing_hours = prop_fishing_hours_cell_predict_rescaled*total_effective_fishing_hours) %>%
-  left_join(global_grid) %>%
-  left_join(fao_lookup) %>%
-    dplyr::select(pixel_id, lon, lat, year, flag_fin, gear, length_category, eez_sovereign, fao_id, fao_major_fishing_area, nom_active_fishing_hours, eff_active_fishing_hours) %>%
-  filter(nom_active_fishing_hours > 0) %>%
-  mutate(sector = "Industrial")
+        full_data <- full_data %>%
+          left_join(lc_fill, by = c("lon", "lat", "flag_fin", "length_category")) %>%
+          left_join(n_preds_df2, by = cat_keys) %>%
+          mutate(pred_presence_gf = case_when(
+            pred_presence_gf == 0 & max_fill > 0 & n_preds == 0 ~ max_fill,
+            TRUE ~ pred_presence_gf)) %>%
+          dplyr::select(-max_fill, -n_preds)
+      }
+    }
+    
+        #### Gap-fill step 3 (last resort): combos still with no presence get presence in their own EEZ
+    n_preds_df3 <- full_data %>%
+      group_by(across(all_of(cat_keys))) %>%
+      summarise(n_preds = sum(pred_presence_gf > 0), .groups = "drop")
 
-if(nrow(all_preds) == 0){
-    cat("skipping", flag, yr, "no predictions made...")
-  next()
-}
+    still_zero <- filter(n_preds_df3, n_preds == 0)
 
+    if (nrow(still_zero) > 0) {
+      cat("gap-fill step 3 (own EEZ):", flag, yr, "-",
+          paste(still_zero$gear, still_zero$length_category, collapse = "; "), "\n")
+
+      full_data <- full_data %>%
+        left_join(n_preds_df3, by = cat_keys) %>%
+        mutate(pred_presence_gf = ifelse(n_preds == 0 & eez_sovereign %in% flag, 1, pred_presence_gf)) %>%
+        dplyr::select(-n_preds)
+    }
+
+    ## Combine stages, rescale within each category, and allocate effort
+    all_preds <- full_data %>%
+      dplyr::select(lon, lat, flag_fin, gear, length_category, year, fao_id, eez_id,
+                    eez_sovereign, pred_prop, pred_presence_gf) %>%
+      mutate(pred_prop_final = pred_prop * pred_presence_gf) %>%
+      filter(pred_prop_final > 0) %>%                       # also drops NAs
+      group_by(flag_fin, gear, length_category) %>%         # year is constant here
+      mutate(prop_fishing_hours_cell_predict_rescaled = pred_prop_final / sum(pred_prop_final)) %>%
+      ungroup() %>%
+      left_join(filter(hist_flag, year == yr)) %>%
+      mutate(nom_active_fishing_hours = prop_fishing_hours_cell_predict_rescaled * total_nominal_fishing_hours,
+             eff_active_fishing_hours = prop_fishing_hours_cell_predict_rescaled * total_effective_fishing_hours) %>%
+      left_join(global_grid) %>%
+      left_join(fao_lookup) %>%
+      dplyr::select(pixel_id, lon, lat, year, flag_fin, gear, length_category, eez_sovereign,
+                    fao_id, fao_major_fishing_area, nom_active_fishing_hours, eff_active_fishing_hours) %>%
+      filter(nom_active_fishing_hours > 0) %>%
+      mutate(sector = "Industrial")
+
+    if (nrow(all_preds) == 0) {
+      cat("skipping", flag, yr, "no predictions made...\n")
+      next
+    }
+    
 # test_preds <- all_preds %>%
 #   dplyr::group_by(lon, lat) %>%
 #   summarise(nom_active_fishing_hours = sum(nom_active_fishing_hours, na.rm = TRUE)) %>%
@@ -591,16 +619,19 @@ if(nrow(all_preds) == 0){
 # plot(test_preds)
 # plot(log(test_preds+1)) # Cool!
 
+    qs::qsave(all_preds, out_file)
+  }
 
-qs::qsave(all_preds, file.path(rdsi_dir, glue("prep/random_forest/predictions_regional/yearly/model_preds_{flag}_{yr}.qs"))) # qs is smaller
-
-    }
+  NULL
 }
 
-stopCluster(cl)
+parallel::stopCluster(cl)
+
+## Report any flags that errored (e.g. missing models) without killing the whole run
+errs <- Filter(function(x) inherits(x, "error"), res)
+if (length(errs)) print(errs)
 
 ```
-
 
 Combine all years for flag and save 
   - need to convert hours to days 

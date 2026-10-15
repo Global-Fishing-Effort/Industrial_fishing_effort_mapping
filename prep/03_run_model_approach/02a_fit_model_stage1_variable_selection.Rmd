@@ -55,7 +55,11 @@ gfi_df <- read.csv(here("data/model_features/global_fishing_index_governance.csv
 # Load prepared data
 model_data <- readRDS(here("data/model_features/prepared_data_1deg.rds")) %>%
   mutate(year = as.numeric(year)) %>%
-  mutate(presence = 1) 
+  mutate(presence = 1) %>%
+   mutate(length_category = factor(length_category,
+                                  levels = c("Less than 6m", "6-12m", "12-24m", "24-50m", "Over 50m"),          # your classes, smallest to largest
+                                  ordered = TRUE),
+          gear            = factor(gear))
 
 ## read in environmental variables
 
@@ -91,7 +95,16 @@ model_data <- readRDS(here("data/model_features/prepared_data_1deg.rds")) %>%
     mutate(gov_score = ifelse(eez_id >= 99999 & is.na(gov_score), "high_seas", gov_score)) %>%
         mutate(gov_score = ifelse(eez_id < 99999 & is.na(gov_score), "no_data", gov_score)) %>%
     dplyr::select(-eez_sovereign, -nearest_seamount_id) %>% 
-    distinct() 
+    distinct() %>%
+     mutate(
+    eez_id  = factor(eez_id),
+    fao_id  = factor(fao_id),
+    meso_id = factor(meso_id),
+     eez_region_world_bank_7 = factor(eez_region_world_bank_7),
+       ocean     = factor(ocean),
+    # ordinal: keep the score order; sentinels sit at the low end so one split isolates them
+    gov_score = factor(gov_score, levels = c("no_data", "high_seas", as.character(0:10)), ordered = TRUE)
+  )
   
   gfw_reception_data <- read.csv(here("data/model_features/deg_1_x_1/gfw_reception_quality.csv"))
 
@@ -147,7 +160,11 @@ hist_fish_data <- qs::qread(here("data/int/rousseau_gear_fix.qs")) %>%
       .groups = 'drop'
     ) %>%
     dplyr::select(flag_fin, gear, length_category, total_fishing_hours) %>%
-    filter(total_fishing_hours > 0)
+    filter(total_fishing_hours > 0) %>%
+   mutate(length_category = factor(length_category,
+                                  levels = c("Less than 6m", "6-12m", "12-24m", "24-50m", "Over 50m"),          # your classes, smallest to largest
+                                  ordered = TRUE),
+          gear            = factor(gear))
   
 flags <- unique(hist_fish_data$flag_fin) # get the flags we need to run models for # 151 of them
 
@@ -182,7 +199,7 @@ flags <- setdiff(flags, missing_flags) # 147 flags to run now
 
 # done_flags <- unique(str_after_last(str_before_last(list.files(file.path(rdsi_dir, "prep/random_forest/stage_1_models/pruning/")), "_"), "_"))
 
-flags_to_run <- setdiff(flags, "") # add any flags we've already run
+flags_to_run <- unique(c("CHN", "USA", "CAN", "CHL", "AUS", "NOR", setdiff(flags, "HND"))) # add any flags we've already run
 
 # Set up parallel backend
 num_cores <- 24
@@ -192,7 +209,7 @@ registerDoParallel(cl)
 # Run the loop in parallel
 foreach(flag = flags_to_run, .packages = c("dplyr", "tidyr", "randomForest", "qs", "glue", "tictoc", "ranger")) %dopar% {
   
-    # flag = "CHN"
+    # flag = "HND"
   model_data_flag <- model_data %>%
     dplyr::select(lon, lat, flag_fin, gear, length_category, year, presence) %>%
     filter(flag_fin == flag)
@@ -231,6 +248,9 @@ foreach(flag = flags_to_run, .packages = c("dplyr", "tidyr", "randomForest", "qs
   importance = "impurity",
   classification = TRUE,
   probability = TRUE,
+  respect.unordered.factors = "order",
+  seed = 123,
+  # num.threads = 1,
   write.forest = TRUE
 )
     toc()
@@ -261,7 +281,10 @@ Now apply variable selection methods
 
 # Set up parallel backend
 
-num_cores <- 30
+flags <- unique(c("CHN", "USA", "TWN", "CAN", "JPN", "ESP", "KOR", "RUS", "CHL", "AUS", "NOR", "GBR", flags)) # order it like this so that bigger fishing countries run first
+
+
+num_cores <- 32
 cl <- makeCluster(num_cores)
 registerDoParallel(cl)
 
@@ -319,6 +342,8 @@ foreach(flag = flags, .packages = c("dplyr", "tidyr", "randomForest", "qs", "glu
         importance = "impurity",
         classification = TRUE,
         probability = TRUE,
+        respect.unordered.factors = "order",
+        seed = 123,
         write.forest = TRUE
       )
     toc()
@@ -382,6 +407,8 @@ foreach(flag = flags, .packages = c("dplyr", "tidyr", "randomForest", "qs", "glu
         num.trees = 100,
         importance = "impurity",
         classification = TRUE,
+        respect.unordered.factors = "order",
+        seed = 123,
         probability = TRUE,
         write.forest = TRUE
       )
@@ -452,27 +479,27 @@ stage_1_flags_done <- unique(sub(".*stage_1_rf_model_full_data_([A-Z]{3})_.*", "
 
 stage_1_flags <- setdiff(stage_1_flags, stage_1_flags_done)
 
-stage_1_flags <- unique(c("CHN", "USA", stage_1_flags)) # move CHN and USA to the front of the list since they take the longest to run...
+# stage_1_flags <- unique(c("CHN", "USA", "TWN", "CAN", "JPN", "ESP", "KOR", "RUS", "CHL", "AUS", "NOR", "GBR", stage_1_flags)) # move CHN and USA to the front of the list since they take the longest to run...
 
-num_cores <- 24
+num_cores <- 28
 cl <- makeCluster(num_cores)
 registerDoParallel(cl)
 
 foreach(flag = stage_1_flags, .packages = c("dplyr", "tidyr", "randomForest", "qs", "glue", "tictoc", "strex", "stats", "ranger", "PRROC")) %dopar% {
 
-#  flag = "IRL"
-  flag_files <- list.files(stage_1_path, pattern = glue("_{flag}_"))
-  # select the model with the next to lowest number of variables. E.g., if the final model run for ZAF is 17, then we want to grab the model with the next to lowest number of variables, which is 19. 
-  n_variables <- as.numeric(str_before_first(str_after_last(flag_files, "_"), "\\."))
-  
-  if(length(n_variables) > 1){
-  best_model_n <- as.character(sort(n_variables[2]))
-  }else{
+  #  flag = "IRL"
+  flag_files <- list.files(stage_1_path, pattern = glue("^stage_1_rf_train_{flag}_\\d+\\.qs$"))
+  # select the model with the second-smallest number of variables. E.g., if the pruned models for ZAF are 17, 19, 23, 29, then we want 19 (17 was the iteration that did not improve AUC-PR).
+  n_variables <- sort(as.numeric(str_before_first(str_after_last(flag_files, "_"), "\\.")))
+
+  if (length(n_variables) > 1) {
+    best_model_n <- as.character(n_variables[2])
+  } else {
     best_model_n <- as.character(n_variables[1])
   }
-  
+
   best_train_model <- qs::qread(file.path(stage_1_path, glue("stage_1_rf_train_{flag}_{best_model_n}.qs")))
-  
+#   
 expanded_formula <- as.formula(
   paste("presence ~", paste(best_train_model$forest$independent.variable.names, collapse = " + "))
 )
@@ -509,6 +536,8 @@ expanded_formula <- as.formula(
         num.trees = 500, # change this to 500 trees
         importance = "impurity",
         classification = TRUE,
+        respect.unordered.factors = "order",
+        seed = 123,
         probability = TRUE,
         write.forest = TRUE
       )

@@ -14,10 +14,13 @@ editor_options:
 # Summary 
 
 Prep a layer which describes the distance of each cell from each home EEZ for the countries which need to use regional models for. Those countries are (you can determine these countries below)
- [1] "BEN" "BGD" "BHS" "BRN" "COD" "COG" "CUB" "DJI" "DOM" "GAB" "GLP" "GMB" "GNB" "GNQ" "GTM" "GUF" "GUY" "IRQ" "JAM" "KWT" "LBN" "LCA" "MDG" "MNE" "MYT"
-[26] "RAA" "RAM" "ROU" "STP" "SUR" "SVN" "SYR" "TGO" "TON" "WLF"
 
-The reason we need this information, is because we are going to create a "reachability" layer. Because these flags are gapfilled with larger regional models, sometimes the predictive spatial spread is too far (e.g., when modelling DOM, some effort is being allocated to the meditteraen). This happens because some flags in that region might have distant water fleets, so allocation will still happen in those places. To fix this, we will create a reachability exclusion layer based on: 
+ [1] "BEN" "BGD" "BHS" "BLZ" "BRN" "COD" "COG" "CUB" "DJI" "DOM" "GAB" "GLP" "GMB" "GNB" "GNQ" "GTM" "GUF" "GUY" "HND" "IRQ" "JAM" "KWT" "LBN" "LCA" "MDG"
+[26] "MNE" "MYT" "RAA" "RAM" "ROU" "STP" "SUR" "SVN" "SYR" "TGO" "TON" "WLF"
+
+ - using new models, only added BEL and HND for gapfilling. 
+
+The reason we need this information, is because we are going to create a "reachability" layer. Because these flags are gapfilled with larger regional models, sometimes the predictive spatial spread is too far (e.g., when modelling DOM, some effort is being allocated to the Mediterranean). This happens because some flags in that region might have distant water fleets, so allocation will still happen in those places. To fix this, we will create a reachability exclusion layer based on: 
 
  - distance from home EEZ (e.g., if the home eez is DOM, we calculate the distance from each cell globally to DOM eez, where anything within DOM eez == 0 km). 
  - average days at sea (DAS) per length class; this will be derived from the Rousseau data. I believe this information is provided per flag country. 
@@ -91,11 +94,11 @@ regions <- fread(here("data/int/larger_regions_iso3c.csv")) %>%
     left_join(regions)
 
   
- modelled_flags_original <- str_before_first(str_after_last(list.files(file.path(rdsi_dir, "prep/random_forest/predictions_industrial_flag_revised_floor_0/"), pattern = ".qs", full.names = TRUE), "_"), "\\.qs")
+ modelled_flags_original <- str_before_first(str_after_last(list.files(file.path(rdsi_dir, "prep/random_forest/predictions_industrial_flag_revised_floor_depth/"), pattern = ".qs", full.names = TRUE), "_"), "\\.qs")
 
-  all_files_flag <- list.files(file.path(rdsi_dir, "prep/random_forest/predictions_industrial_flag_revised_floor_0/"), full.names = TRUE)
+  all_files_flag <- list.files(file.path(rdsi_dir, "prep/random_forest/predictions_industrial_flag_revised_floor_depth/"), full.names = TRUE)
 
-    all_data <- lapply(all_files_flag[-148], qread) %>%
+    all_data <- lapply(all_files_flag[-133], qread) %>%
       bind_rows()
 
 all_data_grouped_2 <- all_data %>% 
@@ -141,7 +144,7 @@ missing_data <- check_rousseau_data %>%
   filter(proportion_hours_modeled != 1) %>%
   filter(proportion_hours_modeled < 0.9999)
 
-flags_missing <- unique(missing_data$flag_country_iso3c) # 4 flags missing
+flags_missing <- unique(missing_data$flag_country_iso3c) # 21 flags missing
 
 regions_missing_df <- hist_fish_data %>% 
   filter(flag_fin %in% c(flags_missing)) %>%
@@ -150,7 +153,7 @@ regions_missing_df <- hist_fish_data %>%
 regions_missing <- hist_fish_data %>% 
   filter(flag_fin %in% c(flags_missing)) %>%
   pull(region) %>%
-  unique() # ok only 7 regions missing, so that's good 
+  unique() # ok only 6 regions missing, so that's good 
   
 
 years_missing <- unique(missing_data$year) # all years missing, because of DOM for example
@@ -184,8 +187,8 @@ sort(flags_missing_fin)
 
 We will first calculate the distance to each EEZ for flag countries that need to be gapfilled using larger regional models
 
- [1] "BEN" "BGD" "BHS" "BRN" "COD" "COG" "CUB" "DJI" "DOM" "GAB" "GLP" "GMB" "GNB" "GNQ" "GTM" "GUF" "GUY" "IRQ" "JAM" "KWT" "LBN" "LCA" "MDG" "MNE" "MYT"
-[26] "RAA" "RAM" "ROU" "STP" "SUR" "SVN" "SYR" "TGO" "TON" "WLF"
+ [1] "BEN" "BGD" "BHS" "BLZ" "BRN" "COD" "COG" "CUB" "DJI" "DOM" "GAB" "GLP" "GMB" "GNB" "GNQ" "GTM" "GUF" "GUY" "HND" "IRQ" "JAM" "KWT" "LBN" "LCA" "MDG"
+[26] "MNE" "MYT" "RAA" "RAM" "ROU" "STP" "SUR" "SVN" "SYR" "TGO" "TON" "WLF"
  
 ```{r}
 eez_to_calculate <- flags_missing_fin
@@ -292,7 +295,8 @@ res_long <- res_df %>%
 
 fwrite(res_long, here("data/int/dist_from_home_eez.csv"))
 
-unique(res_long$eez_id) # 31 good
+length(unique(res_long$eez_id)) # 37 good
+
 test <- res_long %>%
   filter(eez_id == 2139) %>%
   dplyr::select(lon, lat, dist_km) %>%
@@ -678,6 +682,7 @@ fwrite(reachability, here("data/int/reachability_regional_gf.csv"))
 
 test <- read.csv(here("data/int/reachability_regional_gf.csv"))
 unique(test$flag_fin)
+length(unique(test$flag_fin))
 ```
 
 Methods write up: 

@@ -34,6 +34,7 @@ library(randomForest)
 library(PRROC)
 library(janitor)
 library(ranger)
+library(data.table)
 
 source(here("R/dir.R"))
 
@@ -53,7 +54,11 @@ gfi_df <- read.csv(here("data/model_features/global_fishing_index_governance.csv
 # Load prepared data
 model_data <- readRDS(here("data/model_features/prepared_data_1deg.rds")) %>%
   mutate(year = as.numeric(year)) %>%
-  mutate(presence = 1) # i think we need to adjust the prepared data to include cells which have no fishing effort in them. We can do this in the loop below? 
+  mutate(presence = 1) %>% 
+       mutate(length_category = factor(length_category,
+                                  levels = c("Less than 6m", "6-12m", "12-24m", "24-50m", "Over 50m"),          # your classes, smallest to largest
+                                  ordered = TRUE),
+          gear            = factor(gear))
 
 ## read in environmental variables
 
@@ -91,7 +96,16 @@ model_data <- readRDS(here("data/model_features/prepared_data_1deg.rds")) %>%
     mutate(gov_score = ifelse(eez_id >= 99999 & is.na(gov_score), "high_seas", gov_score)) %>%
         mutate(gov_score = ifelse(eez_id < 99999 & is.na(gov_score), "no_data", gov_score)) %>%
     dplyr::select(-eez_sovereign, -nearest_seamount_id) %>% 
-    distinct() 
+    distinct() %>%
+         mutate(
+    eez_id  = factor(eez_id),
+    fao_id  = factor(fao_id),
+    meso_id = factor(meso_id),
+     eez_region_world_bank_7 = factor(eez_region_world_bank_7),
+       ocean     = factor(ocean),
+    # ordinal: keep the score order; sentinels sit at the low end so one split isolates them
+    gov_score = factor(gov_score, levels = c("no_data", "high_seas", as.character(0:10)), ordered = TRUE)
+  )
   
   gfw_reception_data <- read.csv(here("data/model_features/deg_1_x_1/gfw_reception_quality.csv"))
 
@@ -219,7 +233,11 @@ hist_fish_data <- qs::qread(here("data/int/rousseau_gear_fix.qs")) %>%
     ) %>%
     dplyr::select(flag_fin, gear, length_category, total_fishing_hours) %>%
     filter(total_fishing_hours > 0) %>%
-  left_join(rousseau_fix, by = c("flag_fin" = "Country"))
+  left_join(rousseau_fix, by = c("flag_fin" = "Country")) %>%
+       mutate(length_category = factor(length_category,
+                                  levels = c("Less than 6m", "6-12m", "12-24m", "24-50m", "Over 50m"),          # your classes, smallest to largest
+                                  ordered = TRUE),
+          gear            = factor(gear))
 
 missing <- hist_fish_data %>%
   filter(is.na(region)) %>%
@@ -245,7 +263,7 @@ regions_to_run <- unique(hist_fish_data$region) # get the regions we want to run
  - Currently takes ~ 40 minutes with 12 cores. 
 
 ```{r}
-regions_to_run <- unique(hist_fish_data$region) # get the regions we want to run
+regions_to_run <- unique(c("NorthEastAsia", unique(hist_fish_data$region))) # get the regions we want to run
 
 model_data_loop <- model_data %>% 
   left_join(rousseau_fix, by = c("flag_fin" = "Country")) %>%
@@ -300,6 +318,8 @@ model <- ranger(
   importance = "impurity",
   classification = TRUE,
   probability = TRUE,
+  respect.unordered.factors = "order",
+  seed = 123,
   write.forest = TRUE
   )
   toc()
@@ -385,6 +405,8 @@ foreach(region_loop = regions_to_run, .packages = c("dplyr", "tidyr", "randomFor
         num.trees = 100,
         importance = "impurity",
         classification = TRUE,
+        respect.unordered.factors = "order",
+        seed = 123,
         probability = TRUE,
         write.forest = TRUE
       )
@@ -453,6 +475,8 @@ repeat {
         num.trees = 100,
         importance = "impurity",
         classification = TRUE,
+        respect.unordered.factors = "order",
+        seed = 123,
         probability = TRUE,
         write.forest = TRUE
       )
@@ -531,18 +555,30 @@ best_model_n_list <- list()
 for (region_loop in stage_1_regions) {
 
   # region_loop = "IndianP"
-  region_files <- list.files(stage_1_path, pattern = glue("_{region_loop}_"))
+  # region_files <- list.files(stage_1_path, pattern = glue("_{region_loop}_"))
+  # 
+  # # Extract number of variables from filenames
+  # n_variables <- as.numeric(str_before_first(str_after_last(region_files, "_"), "\\."))
+  # 
+  # if (length(n_variables) > 1) {
+  #   best_model_n <- as.character(sort(n_variables)[2])  # Next to lowest; CHECK THIS 
+  # } else {
+  #   best_model_n <- as.character(n_variables[1])
+  # }
+  # 
+  # # Load model and extract formula
+  # best_train_model <- qs::qread(file.path(stage_1_path, glue("stage_1_rf_train_{region_loop}_{best_model_n}.qs")))
   
-  # Extract number of variables from filenames
-  n_variables <- as.numeric(str_before_first(str_after_last(region_files, "_"), "\\."))
-  
+    region_files <- list.files(stage_1_path, pattern = glue("^stage_1_rf_train_{region_loop}_\\d+\\.qs$"))
+
+  n_variables <- sort(as.numeric(str_before_first(str_after_last(region_files, "_"), "\\.")))
+
   if (length(n_variables) > 1) {
-    best_model_n <- as.character(sort(n_variables)[2])  # Next to lowest
+    best_model_n <- as.character(n_variables[2])
   } else {
     best_model_n <- as.character(n_variables[1])
   }
-  
-  # Load model and extract formula
+
   best_train_model <- qs::qread(file.path(stage_1_path, glue("stage_1_rf_train_{region_loop}_{best_model_n}.qs")))
   
   expanded_formula <- as.formula(
@@ -607,6 +643,9 @@ foreach(region_loop = stage_1_regions, .packages = c("dplyr", "tidyr", "randomFo
   num.trees = 500,
   importance = "impurity",
   classification = TRUE,
+  respect.unordered.factors = "order",
+  seed = 123,
+  num.threads = 4,
   probability = TRUE,
   write.forest = TRUE
   )

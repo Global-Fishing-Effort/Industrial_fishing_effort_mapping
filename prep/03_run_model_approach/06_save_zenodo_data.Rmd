@@ -70,8 +70,8 @@ low_sample_flags <- readRDS(here("data/model_features/prepared_data_1deg.rds")) 
 cl <- makeCluster(24)  # could probably increase this? 
 registerDoParallel(cl)
 
-foreach(flag = all_flags, .packages = c("qs", "dplyr", "tidyverse", "glue", "countrycode")) %dopar% {
-  # flag = "IRQ"
+foreach(flag = all_flags, .packages = c("qs", "dplyr", "tidyverse", "glue", "countrycode", "data.table")) %dopar% {
+  # flag = "GAB"
   
   
   all_files_flag_original <- list.files(file.path(rdsi_dir, "prep/random_forest/predictions_industrial_flag_revised_floor_depth/"), pattern = flag, full.names = TRUE)
@@ -86,12 +86,12 @@ foreach(flag = all_flags, .packages = c("qs", "dplyr", "tidyverse", "glue", "cou
     bind_rows() %>%
     mutate(data_type = "flag model")
 
-    if(flag == "GAB"){
-    
-    all_data_flag_original <- all_data_flag_original %>%
-      filter(year != 2017)
-  } # we're going to use regional predictions for GAB 2017, because country predictions are horrible.
-  
+  #   if(flag == "GAB"){
+  #   
+  #   all_data_flag_original <- all_data_flag_original %>%
+  #     filter(year != 2017)
+  # } # we're going to use regional predictions for GAB 2017, because country predictions are horrible.
+  # 
   
   all_data_flag_regional_gf <- lapply(all_files_flag_regional_gf, qread) %>%
     bind_rows()  %>%
@@ -140,7 +140,7 @@ if(nrow(all_data_flag_regional_gf) == 0){
   
 
   
-  write.csv(all_data_fin, file.path(rdsi_dir, glue("prep/random_forest/zenodo_data/mapped_by_flag_country_industrial/model_preds_1950_2017_{flag}.csv")), row.names = FALSE)
+  fwrite(all_data_fin, file.path(rdsi_dir, glue("prep/random_forest/zenodo_data/mapped_by_flag_country_industrial/model_preds_1950_2017_{flag}.csv")))
 }
 
 stopCluster(cl)
@@ -233,6 +233,8 @@ hist_fish_data <- qs::qread(here("data/int/rousseau_gear_fix.qs")) %>%
 missing_data <- hist_fish_data %>%
   filter(proportion_hours_modeled != 1) %>%
   filter(proportion_hours_modeled < 0.9999) # should be 0 after our gapfilling. It is, so we actually do not need to save this file anymore. 
+
+## why is cuba <6m 2017 missing??
  
 # fwrite(hist_fish_data, file.path(rdsi_dir, "prep/random_forest/zenodo_data/known_industrial_effort_rousseau.csv"), row.names = FALSE) 
 

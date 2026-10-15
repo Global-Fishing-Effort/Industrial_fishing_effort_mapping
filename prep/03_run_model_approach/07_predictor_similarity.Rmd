@@ -1,0 +1,172 @@
+---
+title: "Area of applicability"
+output: html_document
+date: "2024-03-20"
+editor_options: 
+  chunk_output_type: console
+---
+
+# Summary 
+
+Here we conduct an Area of Applicability (AOA) analysis on the temporal variables in our data. This is to see if the hindcast years (e.g., 1950-2014) values fall within the range of the training years, and are appropriate to use for this modelling. 
+
+## Environment
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+rm(list = ls())
+
+library(tidyverse)
+library(qs)
+library(here)
+library(terra)
+library(glue)
+library(strex)
+library(CAST)
+
+
+source(here("R/dir.R"))
+
+```
+
+
+## Read in environment and effort data  
+ - i.e. the training data
+
+```{r}
+elnino <- read.csv(here("data/model_features/enso_index.csv"))
+
+pdo <- read.csv(here("data/model_features/pdo_index.csv")) 
+
+world_bank <- read.csv(here("data/model_features/world_bank_regions.csv")) 
+
+gfi_df <- read.csv(here("data/model_features/global_fishing_index_governance.csv"))
+
+# Load prepared data
+model_data <- readRDS(here("data/model_features/prepared_data_1deg.rds")) %>%
+  mutate(year = as.numeric(year)) %>%
+  mutate(presence = 1) 
+
+## read in environmental variables
+
+  global_grid <- read.csv(here("data/model_features/deg_1_x_1/global_grid.csv"))
+  
+  ocean_data <- read.csv(here("data/model_features/deg_1_x_1/errdap_chl.csv")) %>%
+      left_join(read.csv(here("data/model_features/deg_1_x_1/errdap_sst.csv")), by = c("pixel_id", "year")) %>% 
+      left_join(read.csv(here("data/model_features/deg_1_x_1/remss_wind.csv")), by = c("pixel_id", "year")) %>%
+      filter(year %in% c(2015:2024))
+
+
+  spatial_data <- global_grid %>%
+    left_join(read.csv(here("data/model_features/deg_1_x_1/gfw_static_spatial_measures.csv")) %>% dplyr::select(-lat, -lon), by = "pixel_id") %>%
+   left_join(read.csv(here("data/model_features/deg_1_x_1/mesopelagiczones/mesopelagiczones_fixed.csv")), by = "pixel_id") %>%
+   left_join(read.csv(here("data/model_features/deg_1_x_1/eez/eez_fix.csv")), by = "pixel_id") %>%
+   left_join(read.csv(here("data/model_features/deg_1_x_1/fao/fao_fixed.csv")), by = "pixel_id") %>%
+   left_join(read.csv(here("data/model_features/deg_1_x_1/oceans_fixed.csv")), by = "pixel_id") %>%
+    left_join(read.csv(here("data/model_features/deg_1_x_1/seamounts.csv")), by = "pixel_id") %>% 
+   crossing(., year = c(2015:2024)) 
+  
+  mpa_data <- qs::qread(here("data/model_features/deg_1_x_1/mpa/mpa_data_all.qs")) %>%
+    filter(year >= 2015)
+  
+  env_data <- spatial_data %>%
+    left_join(mpa_data) %>%
+    left_join(ocean_data) %>% # cool.
+    dplyr::select(-geometry_wkt) %>%
+    left_join(elnino) %>%
+    left_join(pdo) %>%
+    left_join(world_bank, by = c("eez_id")) %>%
+    mutate(eez_region_world_bank_7 = ifelse(eez_sovereign %in% c("High seas", "Land"), "High seas", eez_region_world_bank_7)) %>% 
+    left_join(gfi_df, by = c("eez_sovereign" = "flag_fin")) %>% # add in global fishing index data here
+    mutate(gov_score = ifelse(eez_id >= 99999 & is.na(gov_score), "high_seas", gov_score)) %>%
+        mutate(gov_score = ifelse(eez_id < 99999 & is.na(gov_score), "no_data", gov_score)) %>%
+    dplyr::select(-eez_sovereign, -nearest_seamount_id) %>% 
+    distinct() 
+  
+  gfw_reception_data <- read.csv(here("data/model_features/deg_1_x_1/gfw_reception_quality.csv"))
+  
+
+## historical fishing data from rousseau
+  hist_fish_data <- qs::qread(here("data/int/rousseau_gear_fix.qs")) %>%
+    ## remove artisanal
+    filter(sector == "I") %>%
+    group_by(flag_fin = country, gear = gear_new, length_category) %>%
+    summarize(
+      total_fishing_hours = sum(eff_active_hours, na.rm = TRUE),
+      .groups = 'drop'
+    ) %>%
+    dplyr::select(flag_fin, gear, length_category, total_fishing_hours) %>%
+    filter(total_fishing_hours > 0)
+  
+flags <- unique(hist_fish_data$flag_fin) # get the flags we need to run models for # 151 of them
+
+env_grid <- env_data %>% 
+  dplyr::select(lon, lat) %>% distinct()
+
+
+```
+
+Let's do a step by step run through example with Australia for industrial fisheries.
+
+We need:
+1. Final fitted model: The ranger object for AUS, industrial, Stage 1 (the final model trained on the full dataset).
+2. Training data: The exact data frame passed to ranger() for that final model, 2015–2024. The FULL DATASET (not the 60/40 split).
+3. Historical prediction data: The exact data frame passed to predict() for that model, 1950–2014.
+4. Allocated effort: Final AUS industrial effort by pixel_id × year, 1950–2014. The FINAL allocated effort, even after the eez constraint and such. 
+5. Grid: global_grid.csv (pixel_id, lon, lat)
+6. Fleet strata (Step 11): Rousseau AUS effort by year × gear × length, and the gear × length combinations present in AUS training data
+
+
+```{r}
+# final fitted model
+
+flag <- "AUS"
+
+rf_s1 <- qs::qread(list.files(file.path(rdsi_dir, "prep/random_forest/stage_1_models"),
+                              pattern = glue("stage_1_rf_model_full_data_{flag}_.*\\.qs$"),
+                              full.names = TRUE)[1])
+
+
+# training data
+model_data_flag <- model_data %>%
+  dplyr::select(lon, lat, flag_fin, gear, length_category, year, presence) %>%
+  filter(flag_fin == flag)
+
+distinct_cats <- model_data_flag %>% distinct(year, flag_fin, gear, length_category)
+
+train_s1 <- tidyr::crossing(env_grid, distinct_cats) %>%
+  left_join(env_data, by = c("lon", "lat", "year")) %>%
+  left_join(model_data_flag, by = c("lon", "lat", "year", "flag_fin", "gear", "length_category")) %>%
+  left_join(gfw_reception_data) %>%
+  mutate(presence = ifelse(is.na(presence), 0, presence)) %>%
+  na.omit() %>%                      # pixel_id kept
+  distinct()
+
+nrow(train_s1) == rf_s1$num.samples  # should be TRUE; if not, check whether keeping pixel_id changed distinct()
+
+
+```
+
+```{r}
+f <- rf_s1$forest
+
+var_treatment <- tibble(
+  var        = f$independent.variable.names,
+  is_numeric = map_lgl(f$covariate.levels, is.null),
+  n_levels   = map_int(f$covariate.levels, length),
+  is_ordered = f$is.ordered
+)
+
+var_treatment %>% print(n = Inf)
+
+# was respect.unordered.factors set? (if absent from the call, the default was used)
+rf_s1$call
+
+sapply(env_data[c("eez_id", "fao_id", "meso_id", "ocean", "gov_score", "eez_region_world_bank_7")], class)
+sapply(model_data[c("gear", "length_category")], class)
+
+rf_s1$forest$covariate.levels$gov_score
+
+```
+
