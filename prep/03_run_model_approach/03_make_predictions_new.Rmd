@@ -90,7 +90,7 @@ model_data <- readRDS(here("data/model_features/prepared_data_1deg.rds")) %>%
     left_join(pdo) %>% 
     left_join(gfw_reception_data) %>%
     left_join(world_bank, by = c("eez_id")) %>%
-    mutate(eez_region_world_bank_7 = ifelse(eez_id %in% c("High seas", "Land"), "High seas", eez_region_world_bank_7)) %>% 
+    mutate(eez_region_world_bank_7 = ifelse(eez_sovereign %in% c("High seas", "Land"), "High seas", eez_region_world_bank_7)) %>% 
     left_join(gfi_df, by = c("eez_sovereign" = "flag_fin")) %>% # add in global fishing index data here
     mutate(gov_score = ifelse(eez_id >= 99999 & is.na(gov_score), "high_seas", gov_score)) %>%
         mutate(gov_score = ifelse(eez_id < 99999 & is.na(gov_score), "no_data", gov_score)) %>%

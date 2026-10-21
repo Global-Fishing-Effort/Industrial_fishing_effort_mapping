@@ -165,11 +165,28 @@ spatially_aggregate_errdap_data_wrapper <- function(dataset_name,
                                                     run_parallel = TRUE,
                                                     years){
   # dataset_name = "ncdcOisst21Agg_LonPM180"
+  # dataset_name = "erdMH1chlamday"
+  
+  
+  # Create a directory for temporary raster files
+  tmp_dir <- "/home/ubuntu/data_storage/tmp"
+  dir.create(tmp_dir, recursive = TRUE, showWarnings = FALSE)
+  
+  # Set environment variables for new worker processes
+  Sys.setenv(
+    TMPDIR = tmp_dir,
+    TMP = tmp_dir,
+    TEMP = tmp_dir
+  )
+  
+  # Configure raster's temporary directory
+  # raster::rasterOptions(tmpdir = tmp_dir)
+  terra::terraOptions(tempdir = tmp_dir)
   
   tmp_data_base <- glue::glue("{data_directory}/erddap/clean/{dataset_name}")
   
   # Create the pattern by collapsing years with "|"
- # years = 2015
+ # years = 2004
   pattern <- paste(years, collapse = "|")
   
   # Create data download folder, if it doesn't already exist
@@ -178,7 +195,8 @@ spatially_aggregate_errdap_data_wrapper <- function(dataset_name,
   if(!dir.exists(tmp_data_directory)) dir.create(tmp_data_directory)
   
   if (run_parallel & dataset_name == "erdMH1chlamday") {
-    plan(multisession, workers = 3) # can probably up this to like 10?
+    # plan(multisession, workers = 10) # can probably up this to like 10?
+    plan(multisession)
   }else if (run_parallel & dataset_name == "ncdcOisst21Agg_LonPM180") {
     plan(multisession)
   } else {
@@ -189,8 +207,14 @@ spatially_aggregate_errdap_data_wrapper <- function(dataset_name,
   setdiff(list.files(glue("{data_directory}/erddap/{dataset_name}"), pattern = pattern), list.files(glue("{tmp_data_directory}"), pattern = pattern)) %>% # only run files that we haven't already run
     future_map_dfr(function(file_temp){
       
-      # file_temp <- "ncdcOisst21Agg_LonPM180_1984-05-27.csv"
+      # Set raster temp directory for this worker
+      # raster::rasterOptions(tmpdir = tmp_dir)
+      terra::terraOptions(tempdir = tmp_dir)
+      
+      # file_temp <- "ncdcOisst21Agg_LonPM180_1982-01-29.csv"
+      # file_temp <- "erdMH1chlamday_2004-05-16.csv"
       # spatial_aggregation = data_grid
+      
       
       date_tmp <- file_temp %>%
         # Extract date
@@ -200,33 +224,89 @@ spatially_aggregate_errdap_data_wrapper <- function(dataset_name,
       processed_file_name <- glue::glue("{tmp_data_directory}/{date_tmp}.csv")
       # If it's already processed, don't need to re-do it
       if(file.exists(processed_file_name)) return()
-      # Load files one at a time
-      data.table::fread(glue::glue("{data_directory}/erddap/{dataset_name}/{file_temp}")) %>%
-        # Now we spatially aggregate over our grid
-        # Convert tabular data to sf points
-        sf::st_as_sf(coords = c("longitude","latitude"),
-                     crs = sf::st_crs(spatial_aggregation)) %>% 
-        # Rasterize points to stars object
-        stars::st_rasterize() %>% 
-        # Convert stars to raster, so we can use exactextractr::exact_extract
-        as("Raster") %>%
-        # Let's spatially aggregate by taking the mean value for each of our pixels
-        exactextractr::exact_extract(spatial_aggregation,
-                                     # From the help: "mean - the mean cell value, weighted by the fraction of each cell that is covered by the polygon"
-                                     "mean",
-                                     # Include pixel_id column so we can match on it later
-                                     append_cols = "pixel_id",
-                                     progress = FALSE) %>% 
-        # Don't save data that are just NAs
-        dplyr::filter(!dplyr::if_all(-c(pixel_id),is.na)) %>%
-        # If there's only one layer of data, give mean value column a meaningful name
-       # dplyr::rename_with(~glue::glue("mean.{dataset_name}"), matches("^mean$")) %>%
-        dplyr::rename_with(~ glue::glue("{.x}.{dataset_name}"), matches("^mean")) %>%
+      
+      
+      
+      if(dataset_name == "erdMH1chlamday"){
+     
+      # Underlying CHL resolution
+        res_chl <- 1 / 24
+
+      data.table::fread(
+        glue::glue("{data_directory}/erddap/{dataset_name}/{file_temp}")
+      ) %>%
+        dplyr::mutate(
+          # snap to cell centres of the global 1/24 degree lattice
+          longitude = -180 + (floor((longitude + 180) / res_chl) + 0.5) * res_chl,
+          latitude  =  -90 + (floor((latitude  +  90) / res_chl) + 0.5) * res_chl
+        ) %>%
+        dplyr::select(longitude, latitude, dplyr::everything()) %>%
+        terra::rast(type = "xyz", crs = "EPSG:4326") %>%
+         exactextractr::exact_extract(
+           spatial_aggregation,
+           "mean",
+           append_cols = "pixel_id",
+           progress = FALSE
+         ) %>%
+         dplyr::filter(!dplyr::if_all(-c(pixel_id), is.na)) %>%
+         dplyr::rename_with(
+           ~ glue::glue("{.x}.{dataset_name}"),
+           matches("^mean")
+         ) %>%
+         dplyr::mutate(date = date_tmp) %>%
+         data.table::fwrite(processed_file_name)
+      
+      }else{
+      
+      data.table::fread(
+        glue::glue("{data_directory}/erddap/{dataset_name}/{file_temp}")
+      ) %>%
+        dplyr::select(longitude, latitude, dplyr::everything(), -dplyr::any_of("zlev")) %>%
+        terra::rast(
+          type = "xyz",
+          crs = "EPSG:4326"
+        ) %>%
+        exactextractr::exact_extract(
+          spatial_aggregation,
+          "mean",
+          append_cols = "pixel_id",
+          progress = FALSE
+        ) %>%
+        dplyr::filter(!dplyr::if_all(-c(pixel_id), is.na)) %>%
+        dplyr::rename_with(
+          ~ glue::glue("{.x}.{dataset_name}"),
+          matches("^mean")
+        ) %>%
         dplyr::mutate(date = date_tmp) %>%
-        # Write aggregated data to clean data folder
         data.table::fwrite(processed_file_name)
+      }
+      
+       # data.table::fread(glue::glue("{data_directory}/erddap/{dataset_name}/{file_temp}")) %>%
+       #  # Now we spatially aggregate over our grid
+       #  # Convert tabular data to sf points
+       #  sf::st_as_sf(coords = c("longitude","latitude"),
+       #               crs = sf::st_crs(spatial_aggregation)) %>%
+       #  # Rasterize points to stars object
+       #  stars::st_rasterize(file = tempfile(tmpdir = tmp_dir, fileext = ".tif")) %>%
+       #  # Convert stars to raster, so we can use exactextractr::exact_extract
+       #  as("Raster") %>%
+       #  # Let's spatially aggregate by taking the mean value for each of our pixels
+       #  exactextractr::exact_extract(spatial_aggregation,
+       #                               # From the help: "mean - the mean cell value, weighted by the fraction of each cell that is covered by the polygon"
+       #                               "mean",
+       #                               # Include pixel_id column so we can match on it later
+       #                               append_cols = "pixel_id",
+       #                               progress = FALSE) %>%
+       #  # Don't save data that are just NAs
+       #  dplyr::filter(!dplyr::if_all(-c(pixel_id),is.na)) %>%
+       #  # If there's only one layer of data, give mean value column a meaningful name
+       # # dplyr::rename_with(~glue::glue("mean.{dataset_name}"), matches("^mean$")) %>%
+       #  dplyr::rename_with(~ glue::glue("{.x}.{dataset_name}"), matches("^mean")) %>%
+       #  dplyr::mutate(date = date_tmp) %>%
+       #  # Write aggregated data to clean data folder
+       #  data.table::fwrite(processed_file_name)
       return()
-    }, .options = furrr_options(globals=c("data_directory","dataset_name","spatial_aggregation"),
+    }, .options = furrr_options(globals=c("data_directory","dataset_name","spatial_aggregation", "tmp_dir", "tmp_data_directory", "pixel_size"),
                                 seed = 101),.progress=TRUE)
 }
 
@@ -235,9 +315,10 @@ spatially_aggregate_errdap_data_wrapper <- function(dataset_name,
 temporally_aggregate_errdap_data_wrapper <- function(dataset_name,
                                                      temporal_aggregation = "year",
                                                      run_parallel = TRUE,
-                                                     years_per_chunk = 5){
-  
-  # dataset_name = "erdMH1chlamday"
+                                                     years_per_chunk = 5,
+                                                     sd_from_monthly = FALSE){
+
+  # dataset_name = "ncdcOisst21Agg_LonPM180"
   # years_per_chunk = 5
   
   # Read in spatially aggregated data
@@ -247,11 +328,15 @@ temporally_aggregate_errdap_data_wrapper <- function(dataset_name,
   # Extract years from file names
   years <- unique(lubridate::year(basename(files)))
   
-  # years <- c(2018:2024)
+  # if sd_from_monthly, first average to monthly means, so the yearly sd reflects
+  # variability across 12 monthly values (matching monthly model output) rather than daily values
+  time_step <- if (sd_from_monthly) "month" else "year"
+  
+  # years <- c(1982:1986)
   
   # Process data in 5-year chunks
   for (i in seq(min(years), max(years), by = years_per_chunk)) {
-    # i = 2021
+    # i = 1982
     chunk_start <- i
     chunk_end <- min(i + years_per_chunk - 1, max(years))
     message(glue::glue("Processing chunk: {chunk_start}-{chunk_end}"))
@@ -264,7 +349,7 @@ temporally_aggregate_errdap_data_wrapper <- function(dataset_name,
     
     result <- future_map_dfr(chunk_files, function(file_temp){
       data.table::fread(file_temp) %>%
-        collapse::ftransform(date = lubridate::floor_date(date, "year")) %>%
+        collapse::ftransform(date = lubridate::floor_date(date, time_step)) %>%
         dplyr::rename_with(~ gsub('mean.', '', .x)) %>%
         dplyr::rename_with(~ gsub('sst', 'sst_c', .x)) %>%
         dplyr::rename_with(~ gsub('vgos', 'surface_current_v_m_s', .x)) %>%
@@ -272,21 +357,33 @@ temporally_aggregate_errdap_data_wrapper <- function(dataset_name,
         dplyr::rename_with(~ gsub('anom', 'anom_sst_c', .x)) %>%
         dplyr::rename_with(~ gsub('nesdisSSH1day', 'slh_m', .x)) %>%
         dplyr::rename_with(~ gsub('erdMH1chlamday', 'chl_mg_per_m3', .x)) %>%
-        dplyr::rename_with(~ gsub('.ncdcOisst_c21Agg_LonPM180', '', .x)) %>%
-        dplyr::select(-one_of("zlev"))
-    }, .options = furrr_options(globals = c("data_directory", "dataset_name"), seed = 101), .progress = TRUE)
+        dplyr::rename_with(~ gsub('.ncdcOisst_c21Agg_LonPM180', '', .x))   %>%
+        dplyr::select(-any_of("zlev"))
+    }, .options = furrr_options(globals = c("data_directory", "dataset_name", "time_step"), seed = 101), .progress = TRUE)
+    
+    if (sd_from_monthly) {
+      
+      result <- result %>%
+        dplyr::select(-any_of("zlev")) %>%
+        collapse::fgroup_by(pixel_id, date) %>%
+        collapse::fmean(keep.group_vars = TRUE) %>%
+        collapse::ftransform(date = lubridate::floor_date(date, "year"))
+    }
     
     # Aggregate the mean and standard deviation separately and then merge
     mean_result <- result %>%
+      dplyr::select(-any_of("zlev")) %>%
       collapse::fgroup_by(pixel_id, date) %>%
       collapse::fmean(keep.group_vars = TRUE)
     
     sd_result <- result %>%
+      dplyr::select(-any_of("zlev")) %>%
       collapse::fgroup_by(pixel_id, date) %>%
       collapse::fsd(keep.group_vars = TRUE)
     
     # Join the mean and sd results by the grouping variables
-    result <- dplyr::left_join(mean_result, sd_result, by = c("pixel_id", "date"), suffix = c("_mean", "_sd"))
+    result <- dplyr::left_join(mean_result, sd_result, by = c("pixel_id", "date"), suffix = c("_mean", "_sd")) %>%
+      dplyr::select(-any_of("zlev"))
     
     
       
