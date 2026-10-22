@@ -64,9 +64,9 @@ model_data <- readRDS(here("data/model_features/prepared_data_1deg.rds")) %>%
 
   global_grid <- read.csv(here("data/model_features/deg_1_x_1/global_grid.csv"))
   
-  ocean_data <- read.csv(here("data/model_features/deg_1_x_1/errdap_chl.csv")) %>%
-  left_join(read.csv(here("data/model_features/deg_1_x_1/errdap_sst.csv")), by = c("pixel_id", "year")) %>% 
-  left_join(read.csv(here("data/model_features/deg_1_x_1/remss_wind.csv")), by = c("pixel_id", "year")) %>%
+  ocean_data <- qread(here("data/model_features/deg_1_x_1/errdap_chl.qs")) %>%
+  left_join(qread(here("data/model_features/deg_1_x_1/errdap_sst.qs")), by = c("pixel_id", "year")) %>% 
+  left_join(qread(here("data/model_features/deg_1_x_1/remss_wind.qs")), by = c("pixel_id", "year")) %>%
   filter(year %in% c(2015:2024)) 
 
 
@@ -80,13 +80,13 @@ model_data <- readRDS(here("data/model_features/prepared_data_1deg.rds")) %>%
    crossing(., year = c(2015:2024)) 
   
     
-  mpa_data <- qs::qread(here("data/model_features/deg_1_x_1/mpa/mpa_data_all.qs")) %>%
-    filter(year >= 2015)
+  # mpa_data <- qs::qread(here("data/model_features/deg_1_x_1/mpa/mpa_data_all.qs")) %>%
+  #   filter(year >= 2015)
   
   
   env_data <- spatial_data %>%
     left_join(ocean_data) %>% # cool.
-    left_join(mpa_data) %>%
+   # left_join(mpa_data) %>%
     dplyr::select(-geometry_wkt) %>%
     left_join(elnino) %>%
     left_join(pdo) %>%
@@ -146,9 +146,10 @@ model_formula_rf <- formula(
     nearest_seamount_distance_m + 
     year +
     ais_reception_positions_per_day_class_A +
-    ais_reception_positions_per_day_class_B +    
-    nearest_mpa_distance_m + 
-    nearest_mpa_years_since_designation
+    ais_reception_positions_per_day_class_B
+  # +    
+  #   nearest_mpa_distance_m + 
+  #   nearest_mpa_years_since_designation
 )
   
 env_grid <- env_data %>% 
@@ -394,7 +395,7 @@ foreach(region_loop = regions_to_run, .packages = c("dplyr", "tidyr", "randomFor
   train <- data_random_forest[samp, ]
   test <- data_random_forest[-samp, ]
   
-  base_model_path <- glue(file.path(rdsi_dir, "prep/random_forest/stage_1_models_regional/pruning/stage_1_rf_train_{region_loop}_28.qs"))
+  base_model_path <- glue(file.path(rdsi_dir, "prep/random_forest/stage_1_models_regional/pruning/stage_1_rf_train_{region_loop}_26.qs")) # CHECK THIS
   
   # Train or load initial model
   if (!file.exists(base_model_path)) {
@@ -555,19 +556,9 @@ best_model_n_list <- list()
 for (region_loop in stage_1_regions) {
 
   # region_loop = "IndianP"
-  # region_files <- list.files(stage_1_path, pattern = glue("_{region_loop}_"))
+
   # 
   # # Extract number of variables from filenames
-  # n_variables <- as.numeric(str_before_first(str_after_last(region_files, "_"), "\\."))
-  # 
-  # if (length(n_variables) > 1) {
-  #   best_model_n <- as.character(sort(n_variables)[2])  # Next to lowest; CHECK THIS 
-  # } else {
-  #   best_model_n <- as.character(n_variables[1])
-  # }
-  # 
-  # # Load model and extract formula
-  # best_train_model <- qs::qread(file.path(stage_1_path, glue("stage_1_rf_train_{region_loop}_{best_model_n}.qs")))
   
     region_files <- list.files(stage_1_path, pattern = glue("^stage_1_rf_train_{region_loop}_\\d+\\.qs$"))
 

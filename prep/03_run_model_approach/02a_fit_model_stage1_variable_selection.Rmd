@@ -65,9 +65,9 @@ model_data <- readRDS(here("data/model_features/prepared_data_1deg.rds")) %>%
 
   global_grid <- read.csv(here("data/model_features/deg_1_x_1/global_grid.csv"))
   
-  ocean_data <- read.csv(here("data/model_features/deg_1_x_1/errdap_chl.csv")) %>%
-      left_join(read.csv(here("data/model_features/deg_1_x_1/errdap_sst.csv")), by = c("pixel_id", "year")) %>% 
-      left_join(read.csv(here("data/model_features/deg_1_x_1/remss_wind.csv")), by = c("pixel_id", "year")) %>%
+  ocean_data <- qread(here("data/model_features/deg_1_x_1/errdap_chl.qs")) %>%
+      left_join(qread(here("data/model_features/deg_1_x_1/errdap_sst.qs")), by = c("pixel_id", "year")) %>% 
+      left_join(qread(here("data/model_features/deg_1_x_1/remss_wind.qs")), by = c("pixel_id", "year")) %>%
       filter(year %in% c(2015:2024))
 
 
@@ -80,11 +80,11 @@ model_data <- readRDS(here("data/model_features/prepared_data_1deg.rds")) %>%
     left_join(read.csv(here("data/model_features/deg_1_x_1/seamounts.csv")), by = "pixel_id") %>% 
    crossing(., year = c(2015:2024)) 
   
-  mpa_data <- qs::qread(here("data/model_features/deg_1_x_1/mpa/mpa_data_all.qs")) %>%
-    filter(year >= 2015)
+  # mpa_data <- qs::qread(here("data/model_features/deg_1_x_1/mpa/mpa_data_all.qs")) %>%
+  #   filter(year >= 2015)
   
   env_data <- spatial_data %>%
-    left_join(mpa_data) %>%
+   # left_join(mpa_data) %>%
     left_join(ocean_data) %>% # cool.
     dplyr::select(-geometry_wkt) %>%
     left_join(elnino) %>%
@@ -145,9 +145,10 @@ model_formula_rf <- formula(
     nearest_seamount_distance_m + 
     year +
     ais_reception_positions_per_day_class_A +
-    ais_reception_positions_per_day_class_B +
-    nearest_mpa_distance_m + 
-    nearest_mpa_years_since_designation
+    ais_reception_positions_per_day_class_B 
+  # +
+  #   nearest_mpa_distance_m + 
+  #   nearest_mpa_years_since_designation
 )
   
 
@@ -202,7 +203,7 @@ flags <- setdiff(flags, missing_flags) # 147 flags to run now
 flags_to_run <- unique(c("CHN", "USA", "CAN", "CHL", "AUS", "NOR", setdiff(flags, "HND"))) # add any flags we've already run
 
 # Set up parallel backend
-num_cores <- 24
+num_cores <- 28
 cl <- makeCluster(num_cores)
 registerDoParallel(cl)
 
@@ -331,7 +332,7 @@ foreach(flag = flags, .packages = c("dplyr", "tidyr", "randomForest", "qs", "glu
   test <- data_random_forest[-samp, ]
   
   ## if the file doesn't exist for some reason, run this. They should all be there from the previous chunk though.
-  if(!file.exists((glue(file.path(rdsi_dir, "prep/random_forest/stage_1_models/pruning/stage_1_rf_train_{flag}_29.qs"))))){
+  if(!file.exists((glue(file.path(rdsi_dir, "prep/random_forest/stage_1_models/pruning/stage_1_rf_train_{flag}_27.qs"))))){
     
         
     tic()
@@ -349,7 +350,7 @@ foreach(flag = flags, .packages = c("dplyr", "tidyr", "randomForest", "qs", "glu
     toc()
   
   }else{ 
-    model <- qs::qread(glue(file.path(rdsi_dir, "prep/random_forest/stage_1_models/pruning/stage_1_rf_train_{flag}_29.qs")))
+    model <- qs::qread(glue(file.path(rdsi_dir, "prep/random_forest/stage_1_models/pruning/stage_1_rf_train_{flag}_27.qs")))
 }
   
   var_imp_i <- data.frame(importance(model)) %>%
@@ -475,17 +476,19 @@ stage_1_flags <- unique(sub(".*stage_1_rf_train_([A-Z]{3})_.*", "\\1", stage_1_f
 
 stage_1_path_done <- file.path(rdsi_dir, "prep/random_forest/stage_1_models/")
 stage_1_files_done <- list.files(stage_1_path_done, full.names = TRUE)[-1]
-stage_1_flags_done <- unique(sub(".*stage_1_rf_model_full_data_([A-Z]{3})_.*", "\\1", stage_1_files_done)) # 118 flags; weird there are more here than in stage 2?!
+stage_1_flags_done <- unique(sub(".*stage_1_rf_model_full_data_([A-Z]{3})_.*", "\\1", stage_1_files_done))
 
-stage_1_flags <- setdiff(stage_1_flags, stage_1_flags_done)
+flags_to_run <- setdiff(stage_1_flags, stage_1_flags_done)
 
 # stage_1_flags <- unique(c("CHN", "USA", "TWN", "CAN", "JPN", "ESP", "KOR", "RUS", "CHL", "AUS", "NOR", "GBR", stage_1_flags)) # move CHN and USA to the front of the list since they take the longest to run...
 
-num_cores <- 28
+# flags_to_run <- unique(c("CHN", "USA", "TWN", "CAN", "JPN", "ESP", "KOR", "RUS", "NOR", "GBR", flags_to_run)) # move CHN and USA to the front of the list since they take the longest to run...
+
+num_cores <- 20
 cl <- makeCluster(num_cores)
 registerDoParallel(cl)
 
-foreach(flag = stage_1_flags, .packages = c("dplyr", "tidyr", "randomForest", "qs", "glue", "tictoc", "strex", "stats", "ranger", "PRROC")) %dopar% {
+foreach(flag = flags_to_run, .packages = c("dplyr", "tidyr", "randomForest", "qs", "glue", "tictoc", "strex", "stats", "ranger", "PRROC")) %dopar% {
 
   #  flag = "IRL"
   flag_files <- list.files(stage_1_path, pattern = glue("^stage_1_rf_train_{flag}_\\d+\\.qs$"))
@@ -552,77 +555,3 @@ stopCluster(cl)
  
 
 ```
-
-Check to see if it worked properly; testing AGO
-
-```{r}
-
-flag = "AGO"
-
-## read in models 
-files <- list.files(file.path(rdsi_dir, "prep/random_forest/stage_1_models/pruning/"), pattern = "AGO", full.names = TRUE)
-
-all_models <- lapply(files, qs::qread)
-
-## get training and testing datasets
-  model_data_flag <- model_data %>%
-    dplyr::select(lon, lat, flag_fin, gear, length_category, year, presence) %>%
-    filter(flag_fin == flag)
-  
-  distinct_cats <- model_data_flag %>%
-    distinct(year, flag_fin, gear, length_category)
-  
-  full_grid <- tidyr::crossing(env_grid, distinct_cats)
-  
-  full_data <- full_grid %>%
-    left_join(env_data, by = c("lon", "lat", "year")) %>%
-    left_join(model_data_flag, by = c("lon", "lat", "year", "flag_fin", "gear", "length_category")) %>%
-    mutate(presence = ifelse(is.na(presence), 0, presence)) %>%
-    dplyr::select(-pixel_id)
-  
-  data_random_forest <- full_data %>% 
-    na.omit() %>%
-    mutate(presence = as.factor(presence)) %>%
-    distinct()
-  
-  
-  # Split data into training and testing sets
-  set.seed(123)
-  samp <- sample(nrow(data_random_forest), 0.6 * nrow(data_random_forest)) 
-  train <- data_random_forest[samp, ]
-  test <- data_random_forest[-samp, ]
-
-  # test the AUC values
-  
-
-# Function to calculate AUC-PR
-calculate_auc_pr <- function(model, test_data, test_labels) {
- # model <- all_models[[i]]
-  
-  # Predict probabilities for the positive class (assumes binary classification)
-    probs <- predict(model, newdata = test_data, type = "prob")[, 2]
-  
-  # Calculate AUC-PR using PRROC package
-  pr <- pr.curve(scores.class0 = probs, weights.class0 = test_labels, curve = TRUE)$auc.integral
-  
-  return(pr)  # Return the AUC-PR value
-}
-
-# Initialize a vector to store AUC-PR scores for each model
-auc_pr_scores <- numeric(length(all_models))
- 
- test_labels <- as.numeric(as.character(test$presence))  # Adjust based on your data
-
-
-
-# Loop through models and calculate AUC-PR
-for (i in 1:length(all_models)) {
-  # i = 2
-  
-  auc_pr_scores[i] <- calculate_auc_pr(model = all_models[[i]], test_data = test, test_labels = test_labels)
-}
- 
- auc_pr_scores # ok this makes sense. The next to last model run (in this case, the second number in the list) is the highest. 
-  
-```
-

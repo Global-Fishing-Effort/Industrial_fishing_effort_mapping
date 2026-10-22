@@ -58,9 +58,9 @@ model_data <- readRDS(here("data/model_features/prepared_data_1deg.rds")) %>%
 
   global_grid <- read.csv(here("data/model_features/deg_1_x_1/global_grid.csv"))
   
-  ocean_data <- read.csv(here("data/model_features/deg_1_x_1/errdap_chl.csv")) %>%
-  left_join(read.csv(here("data/model_features/deg_1_x_1/errdap_sst.csv")), by = c("pixel_id", "year")) %>% 
-  left_join(read.csv(here("data/model_features/deg_1_x_1/remss_wind.csv")), by = c("pixel_id", "year")) %>%
+  ocean_data <- qread(here("data/model_features/deg_1_x_1/errdap_chl.qs")) %>%
+  left_join(qread(here("data/model_features/deg_1_x_1/errdap_sst.qs")), by = c("pixel_id", "year")) %>% 
+  left_join(qread(here("data/model_features/deg_1_x_1/remss_wind.qs")), by = c("pixel_id", "year")) %>%
   filter(year %in% c(2015:2024)) 
 
 
@@ -73,13 +73,13 @@ model_data <- readRDS(here("data/model_features/prepared_data_1deg.rds")) %>%
     left_join(read.csv(here("data/model_features/deg_1_x_1/seamounts.csv")), by = "pixel_id") %>% 
    crossing(., year = c(2015:2024)) 
   
-    mpa_data <- qs::qread(here("data/model_features/deg_1_x_1/mpa/mpa_data_all.qs")) %>%
-    filter(year >= 2015)
+    # mpa_data <- qs::qread(here("data/model_features/deg_1_x_1/mpa/mpa_data_all.qs")) %>%
+    # filter(year >= 2015)
   
   
   env_data <- spatial_data %>%
     left_join(ocean_data) %>% # cool.
-    left_join(mpa_data) %>%
+    # left_join(mpa_data) %>%
     dplyr::select(-geometry_wkt) %>%
     left_join(elnino) %>%
     left_join(pdo) %>%
@@ -156,9 +156,10 @@ full_model_formula <- formula(
     # Year effect
     year +
     ais_reception_positions_per_day_class_A +
-    ais_reception_positions_per_day_class_B + 
-    nearest_mpa_distance_m + 
-    nearest_mpa_years_since_designation
+    ais_reception_positions_per_day_class_B 
+  # + 
+  #   nearest_mpa_distance_m + 
+  #   nearest_mpa_years_since_designation
 )
 
 ```
@@ -281,7 +282,7 @@ train <- model_data_flag[samp, ]
 test <- model_data_flag[-samp, ]
 
 
-if(!file.exists(glue(file.path(rdsi_dir, "prep/random_forest/stage_2_models/pruning/stage_2_rf_train_{flag}_29.qs")))){
+if(!file.exists(glue(file.path(rdsi_dir, "prep/random_forest/stage_2_models/pruning/stage_2_rf_train_{flag}_27.qs")))){
 tic()
   model <- ranger(
   formula = full_model_formula,
@@ -296,7 +297,7 @@ tic()
 toc() # half a second for NZL; 45 secs for CHN
 }else{
   
-  model <- qs::qread(glue(file.path(rdsi_dir, "prep/random_forest/stage_2_models/pruning/stage_2_rf_train_{flag}_29.qs")))
+  model <- qs::qread(glue(file.path(rdsi_dir, "prep/random_forest/stage_2_models/pruning/stage_2_rf_train_{flag}_27.qs")))
   
 }
 
@@ -420,15 +421,6 @@ foreach(flag = stage_2_flags, .packages = c("dplyr", "tidyr", "randomForest", "q
 #  flag = "GUF"
   # flag_files <- list.files(stage_2_path, pattern = glue("_{flag}_"))
   # # select the model with the next to lowest number of variables. E.g., if the final model run for ZAF is 17, then we want to grab the model with the next to lowest number of variables, which is 19. 
-  # n_variables <- as.numeric(str_before_first(str_after_last(flag_files, "_"), "\\."))
-  # 
-  # if(length(n_variables) > 1){ 
-  # best_model_n <- as.character(sort(n_variables[2])) ## CHECK THIS 
-  # }else{
-  #   best_model_n <- as.character(n_variables[1])
-  # }
-  # 
-  # best_train_model <- qs::qread(file.path(stage_2_path, glue("stage_2_rf_train_{flag}_{best_model_n}.qs")))
   
     flag_files <- list.files(stage_2_path, pattern = glue("^stage_2_rf_train_{flag}_\\d+\\.qs$"))
   # select the model with the second-smallest number of variables. E.g., if the pruned models for ZAF are 17, 19, 23, 29, then we want 19 (17 was the iteration that did not improve AUC-PR).

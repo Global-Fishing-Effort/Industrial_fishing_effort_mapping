@@ -1,0 +1,531 @@
+---
+title: "Bias correct historical environmental data for 1 degree"
+author: "Gage Clawson (IMAS)"
+date: '`r format(Sys.time(), "%m/%d/%Y")`'
+output:
+  pdf_document:
+    number_sections: yes
+    toc: true
+    toc_depth: 4
+editor_options:
+  chunk_output_type: console
+---
+
+# Summary
+
+Bias correct the ISIMIP3b GFDL-ESM4 historical SST, surface CHL, and surface wind data against the observational data we train the model on, and save the yearly mean and sd per 1 degree pixel for 1950-2014.
+
+Chlorophyll: https://data.isimip.org/datasets/49dc048b-29e5-4cde-a89a-2fe448d86476/
+
+SST: https://data.isimip.org/datasets/9e8a4b3f-5a56-4f4c-9677-1737a9f952d7/
+
+Surface wind: https://data.isimip.org/datasets/dbcf73ba-878d-41d4-be7d-e28ce13121bc/
+
+The historical runs are free-running, so their year-to-year variability is not synced with the real world. We therefore calculate the bias from climatologies over every year the observations overlap the historical run (which ends in 2014), rather than from a single year:
+
+| Variable | Observations | Overlap | Mean correction | SD correction |
+|---|---|---|---|---|
+| SST | OISST v2.1 (sd of monthly means) | 1982-2014 | additive | ratio |
+| CHL | MODIS Aqua (sd of monthly composites) | 2003-2014 | multiplicative (log space) | ratio |
+| Wind | CCMP v3.1 (sd of daily means) | 1993-2014 | additive | ratio |
+
+ - Model yearly means and sds are calculated the same way as the observed ones: SST and CHL from monthly values, wind from daily values aggregated to 1 degree first.
+ - CHL model months are restricted to the months MODIS observes in each pixel (no polar night or sea ice months), so both sides cover the same season.
+ - The mean correction is the per-pixel difference (SST, wind) or ratio of geometric means (CHL) of the observed and model climatologies over the overlap. CHL is corrected multiplicatively since it is positive and roughly log-normal; an additive correction can push it below zero.
+ - The sd correction is the per-pixel ratio of observed to model climatological sd over the overlap. This also absorbs the CHL scale factor.
+ - Both corrections are constant per pixel, so they can be applied directly to the yearly mean and sd (mean(x + d) = mean(x) + d, mean(x * s) = mean(x) * s, sd(x + d) = sd(x)).
+ - Correction factors that can't be calculated for a pixel are filled from the nearest pixel, and any remaining missing pixel-years are filled from the nearest pixel in the same year.
+ - The ISIMIP 60 arcmin grid has cell centres at x.5 degrees, which are exactly our 1 degree pixel centres, so we read model values at pixel centres instead of resampling.
+
+```{r}
+# Load all necessary packages
+library(tidyverse)
+library(lubridate)
+library(terra)
+library(glue)
+library(here)
+library(qs)
+
+source(here("R/dir.R"))
+
+# Keep terra temp files off the root disk
+tmp_dir <- "/home/ubuntu/data_storage/tmp"
+dir.create(tmp_dir, recursive = TRUE, showWarnings = FALSE)
+terraOptions(tempdir = tmp_dir)
+
+isimip_dir <- file.path(rdsi_raw_dir, "ISIMIP")
+out_dir <- here("data/int/prediction_historical_data/one_degree")
+
+# Years we want to predict on
+hist_years <- 1950:2014
+```
+
+# Defining our global grid
+
+```{r}
+pixel_size <- 1
+
+pixel_centers <- data.table::fread(here("data/model_features/deg_1_x_1/global_grid.csv"),
+                                   select = c("pixel_id", "lon", "lat")) %>%
+  as_tibble() %>%
+  # lon/lat in global_grid.csv are the lower-left corner of each pixel
+  transmute(pixel_id,
+            x = lon + pixel_size / 2,
+            y = lat + pixel_size / 2)
+
+# Pixel centres should sit at x.5 degrees, matching the ISIMIP 60 arcmin cell centres
+stopifnot(all(abs(pixel_centers$x %% 1 - 0.5) < 1e-6),
+          all(abs(pixel_centers$y %% 1 - 0.5) < 1e-6))
+```
+
+# Helper functions
+
+```{r}
+# Unit-sphere coordinates, so nearest-neighbour distances are right across the dateline and near the poles
+sphere_xyz <- function(lon, lat) {
+  lon <- lon * pi / 180
+  lat <- lat * pi / 180
+  cbind(cos(lat) * cos(lon), cos(lat) * sin(lon), sin(lat))
+}
+
+# Fill NA values in `cols` with the value of the nearest non-NA pixel, optionally within groups (e.g. year)
+nn_fill <- function(df, cols, by = NULL) {
+  df <- df %>% left_join(pixel_centers, by = "pixel_id")
+  groups <- if (is.null(by)) list(df) else split(df, df[[by]])
+
+  map_dfr(groups, function(d) {
+    for (col in cols) {
+      miss <- is.na(d[[col]])
+      if (!any(miss) || all(miss)) next
+
+      nn <- FNN::get.knnx(sphere_xyz(d$x[!miss], d$y[!miss]),
+                          sphere_xyz(d$x[miss], d$y[miss]),
+                          k = 1)
+
+      d[[col]][miss] <- d[[col]][!miss][nn$nn.index[, 1]]
+    }
+    d
+  }) %>%
+    dplyr::select(-x, -y)
+}
+
+# Values of every layer at our pixel centres; returns a pixels x layers matrix
+values_at_pixels <- function(r) {
+  # raster must be on our 1 degree grid (cell edges on whole degrees)
+  stopifnot(all(abs(res(r) - pixel_size) < 1e-6),
+            all(abs(origin(r)) < 1e-6))
+
+  cells <- cellFromXY(r, as.matrix(pixel_centers[, c("x", "y")]))
+  stopifnot(!anyNA(cells))
+
+  values(r)[cells, , drop = FALSE]
+}
+
+# Yearly mean and sd rasters (one layer per year) to a long pixel-year table
+annual_to_pixels <- function(r_mean, r_sd, years) {
+  stopifnot(nlyr(r_mean) == length(years), nlyr(r_sd) == length(years))
+
+  tibble(pixel_id = rep(pixel_centers$pixel_id, times = length(years)),
+         year = rep(years, each = nrow(pixel_centers)),
+         mod_mean = as.vector(values_at_pixels(r_mean)),
+         mod_sd = as.vector(values_at_pixels(r_sd)))
+}
+
+# Dates of the layers in a daily file, for either a gregorian or a 365-day (no leap) calendar
+layer_dates <- function(n_layers, first_year, last_year) {
+  dates <- seq(as.Date(glue("{first_year}-01-01")), as.Date(glue("{last_year}-12-31")), by = "day")
+  if (length(dates) == n_layers) return(dates)
+
+  dates_noleap <- dates[!(month(dates) == 2 & day(dates) == 29)]
+  if (length(dates_noleap) == n_layers) return(dates_noleap)
+
+  stop(glue("{n_layers} layers doesn't match a gregorian or 365-day calendar for {first_year}-{last_year}"))
+}
+
+# Observed yearly mean and sd per pixel
+read_obs <- function(path, mean_col, sd_col) {
+  qs::qread(path) %>%
+    as_tibble() %>%
+    transmute(pixel_id,
+              year = as.integer(year),
+              obs_mean = .data[[mean_col]],
+              obs_sd = .data[[sd_col]])
+}
+
+# Per-pixel bias correction factors from the obs and model climatologies over the overlap years:
+#  - mean_adj: obs - model (additive) or ratio of geometric means (multiplicative)
+#  - sd_ratio: obs sd / model sd
+bias_factors <- function(obs, mod, overlap_years, type = c("additive", "multiplicative"),
+                         sd_floor, fill = TRUE, cap_quantiles = c(0.01, 0.99)) {
+  type <- match.arg(type)
+
+  paired <- inner_join(obs, mod, by = c("pixel_id", "year")) %>%
+    filter(year %in% overlap_years, !is.na(obs_mean), !is.na(mod_mean))
+
+  if (type == "multiplicative") paired <- paired %>% filter(obs_mean > 0, mod_mean > 0)
+
+  factors <- paired %>%
+    group_by(pixel_id) %>%
+    summarise(mean_adj = if (type == "additive") mean(obs_mean) - mean(mod_mean)
+                         else exp(mean(log(obs_mean)) - mean(log(mod_mean))),
+              obs_sd = mean(obs_sd, na.rm = TRUE),
+              mod_sd = mean(mod_sd, na.rm = TRUE),
+              n_years = n(),
+              .groups = "drop") %>%
+    # near-zero model sd makes the ratio blow up
+    mutate(sd_ratio = ifelse(mod_sd > sd_floor, obs_sd / mod_sd, NA))
+
+  # cap extreme ratios (mostly coastal pixels, where a 1 degree model cell can't represent coastal obs)
+  cap <- function(x) {
+    q <- quantile(x, cap_quantiles, na.rm = TRUE)
+    pmin(pmax(x, q[1]), q[2])
+  }
+
+  factors <- factors %>% mutate(sd_ratio = cap(sd_ratio))
+  if (type == "multiplicative") factors <- factors %>% mutate(mean_adj = cap(mean_adj))
+
+  if (!fill) return(factors)
+
+  # fill pixels with no factor from the nearest pixel
+  pixel_centers %>%
+    dplyr::select(pixel_id) %>%
+    left_join(factors, by = "pixel_id") %>%
+    nn_fill(c("mean_adj", "sd_ratio"))
+}
+
+apply_bias_correction <- function(mod, factors, type = c("additive", "multiplicative")) {
+  type <- match.arg(type)
+
+  mod %>%
+    left_join(factors %>% dplyr::select(pixel_id, mean_adj, sd_ratio), by = "pixel_id") %>%
+    mutate(mean = if (type == "additive") mod_mean + mean_adj else mod_mean * mean_adj,
+           sd = mod_sd * sd_ratio)
+}
+
+# Checks:
+#  - stability: factors from each half of the overlap should broadly agree, otherwise they are mostly noise
+#  - residual: after correction, the overlap mean and sd should match obs. A multiplicative correction
+#    matches geometric means, so its mean bias is in log10 space (both should be ~0 after correction)
+check_bias_correction <- function(obs, mod, corrected, overlap_years, type, sd_floor,
+                                  cap_quantiles = c(0.01, 0.99)) {
+  halves <- split(overlap_years, cut(seq_along(overlap_years), 2, labels = FALSE))
+  f1 <- bias_factors(obs, mod, halves[[1]], type, sd_floor, fill = FALSE, cap_quantiles = cap_quantiles)
+  f2 <- bias_factors(obs, mod, halves[[2]], type, sd_floor, fill = FALSE, cap_quantiles = cap_quantiles)
+
+  stability <- inner_join(f1, f2, by = "pixel_id", suffix = c("_1", "_2")) %>%
+    summarise(mean_adj_cor = cor(mean_adj_1, mean_adj_2, use = "complete.obs"),
+              mean_adj_median_abs_diff = median(abs(mean_adj_1 - mean_adj_2), na.rm = TRUE),
+              sd_ratio_cor = cor(sd_ratio_1, sd_ratio_2, use = "complete.obs"),
+              sd_ratio_median_abs_diff = median(abs(sd_ratio_1 - sd_ratio_2), na.rm = TRUE))
+
+  bias_fun <- if (type == "additive") function(o, m) o - m else function(o, m) log10(o) - log10(m)
+
+  residual <- inner_join(obs, corrected, by = c("pixel_id", "year")) %>%
+    filter(year %in% overlap_years) %>%
+    summarise(raw_mean_bias = mean(bias_fun(obs_mean, mod_mean), na.rm = TRUE),
+              corrected_mean_bias = mean(bias_fun(obs_mean, mean), na.rm = TRUE),
+              raw_sd_ratio = mean(obs_sd, na.rm = TRUE) / mean(mod_sd, na.rm = TRUE),
+              corrected_sd_ratio = mean(obs_sd, na.rm = TRUE) / mean(sd, na.rm = TRUE))
+
+  list(stability = stability, residual = residual)
+}
+
+# Map a per-pixel column
+plot_pixels <- function(df, col, ...) {
+  df %>%
+    left_join(pixel_centers, by = "pixel_id") %>%
+    dplyr::select(x, y, all_of(col)) %>%
+    rast(type = "xyz", crs = "EPSG:4326") %>%
+    plot(main = col, ...)
+}
+
+# Comparison plots of the observations, raw ISIMIP, and bias corrected ISIMIP
+source_colours <- c("Observed" = "#1f1f1e", "ISIMIP raw" = "#eb6834", "ISIMIP corrected" = "#2a78d6")
+
+# 1 degree cell area scales with cos(latitude)
+pixel_weights <- pixel_centers %>% transmute(pixel_id, w = cos(y * pi / 180))
+
+bias_plot_data <- function(obs, mod, corrected) {
+  # only pixels with both obs and model data, so all three sources average over the same ocean
+  common_pixels <- intersect(mod$pixel_id[!is.na(mod$mod_mean)], obs$pixel_id[!is.na(obs$obs_mean)])
+
+  bind_rows(
+    obs %>% transmute(pixel_id, year, source = "Observed", mean = obs_mean, sd = obs_sd),
+    mod %>% transmute(pixel_id, year, source = "ISIMIP raw", mean = mod_mean, sd = mod_sd),
+    corrected %>% transmute(pixel_id, year, source = "ISIMIP corrected", mean, sd)) %>%
+    filter(pixel_id %in% common_pixels) %>%
+    mutate(source = factor(source, levels = names(source_colours)))
+}
+
+# Area-weighted global yearly mean and sd through time
+plot_bias_timeseries <- function(obs, mod, corrected, overlap_years, units) {
+  bias_plot_data(obs, mod, corrected) %>%
+    inner_join(pixel_weights, by = "pixel_id") %>%
+    group_by(source, year) %>%
+    summarise(across(c(mean, sd), ~ weighted.mean(.x, w, na.rm = TRUE)), .groups = "drop") %>%
+    pivot_longer(c(mean, sd), names_to = "statistic") %>%
+    ggplot(aes(year, value, colour = source)) +
+    annotate("rect", xmin = min(overlap_years), xmax = max(overlap_years),
+             ymin = -Inf, ymax = Inf, fill = "grey90") +
+    geom_line(linewidth = 0.7) +
+    facet_wrap(~ statistic, ncol = 1, scales = "free_y",
+               labeller = as_labeller(c(mean = "Yearly mean", sd = "Yearly sd"))) +
+    scale_colour_manual(values = source_colours) +
+    labs(x = NULL, y = units, colour = NULL,
+         caption = "Shaded: overlap years used to fit the correction. Area-weighted mean over pixels with observed and model data.") +
+    theme_minimal() +
+    theme(legend.position = "top", panel.grid.minor = element_blank())
+}
+
+# Maps of the observed, raw, and corrected yearly mean, averaged over `years`
+plot_bias_maps <- function(obs, mod, corrected, years, units, trans = "identity") {
+  bias_plot_data(obs, mod, corrected) %>%
+    filter(year %in% years) %>%
+    group_by(source, pixel_id) %>%
+    summarise(mean = mean(mean, na.rm = TRUE), .groups = "drop") %>%
+    left_join(pixel_centers, by = "pixel_id") %>%
+    ggplot(aes(x, y, fill = mean)) +
+    geom_raster() +
+    facet_wrap(~ source, ncol = 1) +
+    scale_fill_gradient(low = "#cde2fb", high = "#0d366b", trans = trans, na.value = "grey80") +
+    coord_quickmap(expand = FALSE) +
+    labs(x = NULL, y = NULL, fill = units,
+         title = glue("Yearly mean, {min(years)}-{max(years)}")) +
+    theme_minimal() +
+    theme(panel.grid = element_blank())
+}
+
+# Maps of model minus obs, raw vs corrected, averaged over `years`; log = TRUE shows log10(model / obs) (for CHL)
+plot_bias_difference_maps <- function(obs, mod, corrected, years, units, log = FALSE) {
+  diff_fun <- if (log) function(m, o) log10(m) - log10(o) else function(m, o) m - o
+
+  diffs <- bias_plot_data(obs, mod, corrected) %>%
+    filter(year %in% years) %>%
+    group_by(source, pixel_id) %>%
+    summarise(mean = mean(mean, na.rm = TRUE), .groups = "drop") %>%
+    pivot_wider(names_from = source, values_from = mean) %>%
+    transmute(pixel_id,
+              `ISIMIP raw` = diff_fun(`ISIMIP raw`, Observed),
+              `ISIMIP corrected` = diff_fun(`ISIMIP corrected`, Observed)) %>%
+    pivot_longer(-pixel_id, names_to = "source", values_to = "diff") %>%
+    mutate(source = factor(source, levels = c("ISIMIP raw", "ISIMIP corrected"))) %>%
+    left_join(pixel_centers, by = "pixel_id")
+
+  # symmetric limits from the raw bias, so both panels share one scale
+  lim <- quantile(abs(diffs$diff[diffs$source == "ISIMIP raw"]), 0.99, na.rm = TRUE)
+
+  ggplot(diffs, aes(x, y, fill = diff)) +
+    geom_raster() +
+    facet_wrap(~ source, ncol = 1) +
+    scale_fill_gradient2(low = "#2a78d6", mid = "#e6e5e0", high = "#eb6834", midpoint = 0,
+                         limits = c(-lim, lim), oob = scales::squish) +
+    coord_quickmap(expand = FALSE) +
+    labs(x = NULL, y = NULL,
+         fill = if (log) "log10(model / obs)" else glue("Model - obs\n({units})"),
+         title = glue("Model minus observed yearly mean, {min(years)}-{max(years)}")) +
+    theme_minimal() +
+    theme(panel.grid = element_blank())
+}
+
+# All pixels x years, with missing pixel-years filled from the nearest pixel in the same year
+complete_and_fill <- function(corrected, mean_name, sd_name) {
+  crossing(pixel_id = pixel_centers$pixel_id, year = hist_years) %>%
+    left_join(corrected %>% dplyr::select(pixel_id, year, mean, sd), by = c("pixel_id", "year")) %>%
+    nn_fill(c("mean", "sd"), by = "year") %>%
+    rename(!!mean_name := mean, !!sd_name := sd)
+}
+```
+
+# SST
+
+ - Observations: OISST v2.1, yearly mean and sd of monthly means, 1982-2024. OISST starts Sep 1981, so 1982 is the first full year.
+ - Model: monthly tos (degC) at 60 arcmin, 1850-2014.
+
+```{r}
+sst_overlap <- 1982:2014
+sst_sd_floor <- 0.05 # degC
+
+sst_obs <- read_obs(here("data/model_features/deg_1_x_1/errdap_sst.qs"), "sst_c_mean", "sst_c_sd")
+
+sst_hist_raw <- rast(file.path(isimip_dir, "sst/gfdl-esm4_r1i1p1f1_historical_tos_60arcmin_global_monthly_1850_2014.nc"))
+
+sst_layer_years <- rep(1850:2014, each = 12)
+stopifnot(nlyr(sst_hist_raw) == length(sst_layer_years))
+
+keep <- sst_layer_years %in% hist_years
+sst_hist <- sst_hist_raw[[which(keep)]]
+
+# Yearly mean and sd of the 12 monthly values, matching how the obs are calculated
+sst_hist_annual <- annual_to_pixels(
+  tapp(sst_hist, index = sst_layer_years[keep], fun = "mean", na.rm = TRUE),
+  tapp(sst_hist, index = sst_layer_years[keep], fun = "sd", na.rm = TRUE),
+  years = hist_years)
+
+sst_factors <- bias_factors(sst_obs, sst_hist_annual, sst_overlap, "additive", sd_floor = sst_sd_floor)
+
+sst_corrected <- apply_bias_correction(sst_hist_annual, sst_factors, "additive")
+
+check_bias_correction(sst_obs, sst_hist_annual, sst_corrected, sst_overlap, "additive", sst_sd_floor)
+plot_pixels(sst_factors, "mean_adj")
+plot_pixels(sst_factors, "sd_ratio")
+
+plot_bias_timeseries(sst_obs, sst_hist_annual, sst_corrected, sst_overlap, "SST (degC)")
+plot_bias_maps(sst_obs, sst_hist_annual, sst_corrected, sst_overlap, "degC")
+plot_bias_difference_maps(sst_obs, sst_hist_annual, sst_corrected, sst_overlap, "degC")
+# a single year still differs by that year's weather, since the historical run isn't synced to real years
+plot_bias_difference_maps(sst_obs, sst_hist_annual, sst_corrected, 2014, "degC")
+
+sst_yearly <- complete_and_fill(sst_corrected, "sst_c_mean", "sst_c_sd")
+
+sum(is.na(sst_yearly$sst_c_mean)) # should be 0
+nrow(sst_yearly) == nrow(pixel_centers) * length(hist_years) # TRUE
+
+qs::qsave(sst_factors, file.path(out_dir, "bias_factors_sst.qs"))
+qs::qsave(sst_yearly, file.path(out_dir, "sst_yearly_1950_2014.qs"))
+```
+
+# CHL
+
+ - Observations: MODIS Aqua surface chlorophyll-a (mg m-3), yearly mean and sd of monthly composites, 2003-2024.
+ - Model: monthly chl (kg m-3) at 60 arcmin and 35 depth levels, 1850-2014. We use the surface level (2.5 m).
+
+```{r}
+chl_overlap <- 2003:2014
+chl_sd_floor <- 0.001 # mg m-3
+# looser cap than SST/wind: coastal obs/model ratios of 10x+ are real differences (rivers, turbid water) that
+# the 99th percentile cap would clip, leaving coastal CHL well below the obs the model is trained on
+chl_cap_quantiles <- c(0.001, 0.999)
+
+chl_obs <- read_obs(here("data/model_features/deg_1_x_1/errdap_chl.qs"), "chl_mg_per_m3_mean", "chl_mg_per_m3_sd")
+
+chl_hist_raw <- rast(file.path(isimip_dir, "chl/gfdl-esm4_r1i1p1f1_historical_chl_60arcmin_global_monthly_1850_2014.nc"))
+
+# Surface (2.5 m) layers, ordered by time step. fixed = TRUE, since as a regex "chl_lev=2.5" also matches "chl_lev=2250"
+surface_layers <- grep("chl_lev=2.5_", names(chl_hist_raw), fixed = TRUE, value = TRUE)
+surface_layers <- surface_layers[order(as.integer(sub(".*_", "", surface_layers)))]
+
+chl_layer_years <- rep(1850:2014, each = 12)
+chl_layer_months <- rep(1:12, times = length(1850:2014))
+stopifnot(length(surface_layers) == length(chl_layer_years))
+
+keep <- chl_layer_years %in% hist_years
+
+# kg m-3 to mg m-3
+chl_hist <- chl_hist_raw[[surface_layers[keep]]] * 1e6
+
+# Months MODIS observes in each pixel: observed in at least half the overlap years
+chl_monthly_dir <- file.path(rdsi_raw_dir, "erddap/clean/erdMH1chlamday/spatially_aggregated_1_degree")
+
+chl_obs_months <- list.files(chl_monthly_dir, pattern = paste(chl_overlap, collapse = "|"), full.names = TRUE) %>%
+  map_dfr(~ data.table::fread(.x, select = c("pixel_id", "date"))) %>%
+  mutate(month = month(date)) %>%
+  count(pixel_id, month) %>%
+  filter(n >= length(chl_overlap) / 2) %>%
+  transmute(pixel_id, month, observed = TRUE)
+
+chl_hist_monthly <- tibble(
+  pixel_id = rep(pixel_centers$pixel_id, times = nlyr(chl_hist)),
+  year = rep(chl_layer_years[keep], each = nrow(pixel_centers)),
+  month = rep(chl_layer_months[keep], each = nrow(pixel_centers)),
+  chl = as.vector(values_at_pixels(chl_hist)))
+
+# Yearly mean and sd over the months MODIS observes in each pixel; pixels MODIS never observes keep all months
+chl_hist_annual <- chl_hist_monthly %>%
+  left_join(chl_obs_months, by = c("pixel_id", "month")) %>%
+  filter(coalesce(observed, FALSE) | !pixel_id %in% chl_obs_months$pixel_id) %>%
+  collapse::fgroup_by(pixel_id, year) %>%
+  collapse::fsummarise(mod_mean = collapse::fmean(chl),
+                       mod_sd = collapse::fsd(chl)) %>%
+  as_tibble() %>%
+  # match the obs: a single month gives sd 0, not NA
+  mutate(mod_sd = ifelse(!is.na(mod_mean) & is.na(mod_sd), 0, mod_sd))
+
+rm(chl_hist_monthly)
+gc()
+
+chl_factors <- bias_factors(chl_obs, chl_hist_annual, chl_overlap, "multiplicative", sd_floor = chl_sd_floor,
+                            cap_quantiles = chl_cap_quantiles)
+
+# check nothing degenerate got through the looser cap: ~20-50 at river mouths is plausible, thousands is not
+summary(chl_factors$mean_adj)
+summary(chl_factors$sd_ratio)
+
+chl_corrected <- apply_bias_correction(chl_hist_annual, chl_factors, "multiplicative")
+
+check_bias_correction(chl_obs, chl_hist_annual, chl_corrected, chl_overlap, "multiplicative", chl_sd_floor,
+                      cap_quantiles = chl_cap_quantiles)
+plot_pixels(chl_factors %>% mutate(log10_mean_adj = log10(mean_adj)), "log10_mean_adj")
+plot_pixels(chl_factors, "sd_ratio")
+
+plot_bias_timeseries(chl_obs, chl_hist_annual, chl_corrected, chl_overlap, "CHL (mg m-3)")
+plot_bias_maps(chl_obs, chl_hist_annual, chl_corrected, chl_overlap, "mg m-3", trans = "log10")
+plot_bias_difference_maps(chl_obs, chl_hist_annual, chl_corrected, chl_overlap, "mg m-3", log = TRUE)
+plot_bias_difference_maps(chl_obs, chl_hist_annual, chl_corrected, 2014, "mg m-3", log = TRUE)
+
+chl_yearly <- complete_and_fill(chl_corrected, "chl_mg_per_m3_mean", "chl_mg_per_m3_sd")
+
+sum(is.na(chl_yearly$chl_mg_per_m3_mean)) # should be 0
+nrow(chl_yearly) == nrow(pixel_centers) * length(hist_years) # TRUE
+
+qs::qsave(chl_factors, file.path(out_dir, "bias_factors_chl.qs"))
+qs::qsave(chl_yearly, file.path(out_dir, "chl_yearly_1950_2014.qs"))
+```
+
+# Wind
+
+ - Observations: CCMP v3.1 wind speed (m s-1), yearly mean and sd of daily means, 1993-2024.
+ - Model: daily sfcWind (m s-1) at 0.5 degrees, already bias adjusted to W5E5 by ISIMIP. We use the ocean-masked daily files in `ISIMIP/wind/ocean`.
+ - Daily fields are aggregated to 1 degree before calculating the yearly sd, as in the obs pipeline.
+
+```{r}
+wind_overlap <- 1993:2014
+wind_sd_floor <- 0.1 # m s-1
+
+wind_obs <- read_obs(here("data/model_features/deg_1_x_1/remss_wind.qs"), "wind_speed_ms_mean", "wind_speed_ms_sd")
+
+wind_files <- list.files(file.path(isimip_dir, "wind/ocean"), pattern = "_ocean\\.tif$", full.names = TRUE)
+
+wind_hist_annual <- map_dfr(wind_files, function(file) {
+  # file <- wind_files[1]
+  file_years <- as.integer(str_match(basename(file), "_([0-9]{4})_([0-9]{4})")[, 2:3])
+
+  r <- rast(file)
+  dates <- layer_dates(nlyr(r), file_years[1], file_years[2])
+  keep <- year(dates) %in% hist_years
+  if (!any(keep)) return(NULL)
+
+  yrs <- year(dates[keep])
+
+  # 0.5 to 1 degree, daily
+  r_1deg <- aggregate(r[[which(keep)]], fact = 2, fun = "mean", na.rm = TRUE)
+
+  annual_to_pixels(tapp(r_1deg, index = yrs, fun = "mean", na.rm = TRUE),
+                   tapp(r_1deg, index = yrs, fun = "sd", na.rm = TRUE),
+                   years = unique(yrs))
+})
+
+# every year once
+stopifnot(setequal(unique(wind_hist_annual$year), hist_years),
+          nrow(wind_hist_annual) == nrow(pixel_centers) * length(hist_years))
+
+wind_factors <- bias_factors(wind_obs, wind_hist_annual, wind_overlap, "additive", sd_floor = wind_sd_floor)
+
+wind_corrected <- apply_bias_correction(wind_hist_annual, wind_factors, "additive")
+
+check_bias_correction(wind_obs, wind_hist_annual, wind_corrected, wind_overlap, "additive", wind_sd_floor)
+plot_pixels(wind_factors, "mean_adj")
+plot_pixels(wind_factors, "sd_ratio")
+
+plot_bias_timeseries(wind_obs, wind_hist_annual, wind_corrected, wind_overlap, "Wind speed (m s-1)")
+plot_bias_maps(wind_obs, wind_hist_annual, wind_corrected, wind_overlap, "m s-1")
+plot_bias_difference_maps(wind_obs, wind_hist_annual, wind_corrected, wind_overlap, "m s-1")
+plot_bias_difference_maps(wind_obs, wind_hist_annual, wind_corrected, 2014, "m s-1")
+
+wind_yearly <- complete_and_fill(wind_corrected, "wind_speed_ms_mean", "wind_speed_ms_sd")
+
+sum(is.na(wind_yearly$wind_speed_ms_mean)) # should be 0
+nrow(wind_yearly) == nrow(pixel_centers) * length(hist_years) # TRUE
+
+qs::qsave(wind_factors, file.path(out_dir, "bias_factors_wind.qs"))
+qs::qsave(wind_yearly, file.path(out_dir, "wind_yearly_1950_2014.qs"))
+```

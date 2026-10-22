@@ -25,6 +25,7 @@ library(countrycode)
 library(sf)
 library(ranger)
 library(data.table)
+library(strex)
 
 source(here("R/dir.R"))
 ```
@@ -53,15 +54,14 @@ model_data <- readRDS(here("data/model_features/prepared_data_1deg.rds")) %>%
 
   global_grid <- read.csv(here("data/model_features/deg_1_x_1/global_grid.csv"))
   
-  ocean_data <- read.csv(here("data/model_features/deg_1_x_1/errdap_chl.csv")) %>%
-  left_join(read.csv(here("data/model_features/deg_1_x_1/errdap_sst.csv")), by = c("pixel_id", "year")) %>% 
-  left_join(read.csv(here("data/model_features/deg_1_x_1/remss_wind.csv")), by = c("pixel_id", "year")) %>%
+  ocean_data <- qread(here("data/model_features/deg_1_x_1/errdap_chl.qs")) %>%
+  left_join(qread(here("data/model_features/deg_1_x_1/errdap_sst.qs")), by = c("pixel_id", "year")) %>% 
+  left_join(qread(here("data/model_features/deg_1_x_1/remss_wind.qs")), by = c("pixel_id", "year")) %>%
   filter(year %in% c(2015:2024))
   
   ocean_data_historical <- qs::qread(here("data/int/prediction_historical_data/one_degree/chl_yearly_1950_2014.qs")) %>%
-    dplyr::select(-pixel_area_m2) %>%
-  left_join(qs::qread(here("data/int/prediction_historical_data/one_degree/sst_yearly_1950_2014.qs")) %>%  dplyr::select(-pixel_area_m2), by = c("pixel_id", "year")) %>% 
-  left_join(qs::qread(here("data/int/prediction_historical_data/one_degree/wind_yearly_1950_2014.qs")) %>% mutate(year = as.numeric(year)) %>% dplyr::select(-pixel_area_m2), by = c("pixel_id", "year"))
+  left_join(qs::qread(here("data/int/prediction_historical_data/one_degree/sst_yearly_1950_2014.qs")), by = c("pixel_id", "year")) %>% 
+  left_join(qs::qread(here("data/int/prediction_historical_data/one_degree/wind_yearly_1950_2014.qs")) %>% mutate(year = as.numeric(year)), by = c("pixel_id", "year"))
 
   ocean_data_all <- ocean_data %>%
     rbind(ocean_data_historical)
@@ -79,13 +79,13 @@ model_data <- readRDS(here("data/model_features/prepared_data_1deg.rds")) %>%
     
     sea_ice_df <- qs::qread(here("data/model_features/deg_1_x_1/sea_ice_features_lit.qs"))
     
-  mpa_data <- qs::qread(here("data/model_features/deg_1_x_1/mpa/mpa_data_all.qs"))
+  # mpa_data <- qs::qread(here("data/model_features/deg_1_x_1/mpa/mpa_data_all.qs"))
   
   
   env_data <- spatial_data %>%
     left_join(sea_ice_df) %>%
     left_join(ocean_data_all) %>% # cool.
-    left_join(mpa_data) %>%
+   # left_join(mpa_data) %>%
     left_join(elnino) %>%
     left_join(pdo) %>% 
     left_join(gfw_reception_data) %>%
@@ -178,13 +178,6 @@ fao_spatial <- fread(here("data/model_features/deg_1_x_1/fao/fao_fixed.csv")) %>
 global_grid <- read.csv(here("data/model_features/deg_1_x_1/global_grid.csv")) %>%
   dplyr::select(lon, lat, pixel_id)
 
-access_data <- qs::qread(here("data/int/prediction_historical_data/catch_fishing_access.qs"))
-access_data_high_seas <- qs::qread(here("data/int/prediction_historical_data/catch_fishing_access_high_seas.qs"))
-
-test <- access_data %>%
-  filter(year == 2017, 
-         flag_fin == "BEN")
-
 env_grid <- env_data %>% 
   dplyr::select(lon, lat) %>% 
   distinct()
@@ -241,7 +234,7 @@ flag_order <- hist_fish_data %>%
   count(flag_fin, sort = TRUE) %>%
   pull(flag_fin)
 
-flag_order <- unique(c("CHN", "TWN", "USA", "CAN", "JPN", "ESP", "KOR", "RUS", "CHL", "AUS", "NOR", "GBR", flag_order))
+flag_order <- unique(c("CHN", "AUS", "TWN", "USA", "CAN", "JPN", "ESP", "KOR", "RUS", "CHL", "NOR", "GBR", flag_order))
 
 key_cols <- c("pixel_id", "lon", "lat", "year", "flag_fin", "gear", "length_category", "eez_sovereign")
 out_dir  <- file.path(rdsi_dir, "prep/random_forest/predictions_all/yearly")
@@ -293,6 +286,7 @@ foreach(flag = flag_order, .packages = c("dplyr", "tidyr", "ranger", "qs", "glue
   NULL
 }
 
+## not sure why, but when it is finished it doesn't automatically end the code. Need to look into this. 
 stopCluster(cl)
 
 ```
@@ -302,6 +296,7 @@ First, we need to make an EEZ "accessibility" layer based on predictions for eac
 
  - Problem: There are some countries for which we can not make predictions from 2015-2017, but do make predictions for earlier years (Yemen for example).  - Solution: In these cases, we use the positive predictions from maximum year they have in the data to as our accessibility layer. For example, Yemen has predictions for 2013, so we will use that as the maximum number of cells. 
 
+ - only takes a couple of mins
  
 ```{r}
 
@@ -475,9 +470,8 @@ test <- qs::qread(file.path(rdsi_dir, ("prep/random_forest/eez_2015_2017_referen
 test <- qs::qread(file.path(rdsi_dir, ("prep/random_forest/eez_2015_2017_reference_cells_0/access_mask_2015_2017_IDN.qs")))
 test <- qs::qread(file.path(rdsi_dir, ("prep/random_forest/eez_2015_2017_reference_cells_0/access_mask_2015_2017_THA.qs"))) 
 test <- qs::qread(file.path(rdsi_dir, ("prep/random_forest/eez_2015_2017_reference_cells_0/access_mask_2015_2017_BGD.qs"))) 
-# OK so THA and BGD might be too small??
 
-# test <- qs::qread(file.path(rdsi_dir, ("prep/random_forest/eez_2015_2017_reference_cells_0/access_mask_2015_2017_YEM.qs")))  
+# test <- qs::qread(file.path(rdsi_dir, ("prep/random_forest/eez_2015_2017_reference_cells_0/access_mask_2015_2017_YEM.qs")))
 # 
 # test2 <- test %>%
 #   distinct(lon, lat, keep) %>%
@@ -532,10 +526,10 @@ all_n_ref_data <- lapply(files, qread) %>%
 n_ref_group <- all_n_ref_data %>%
   group_by(flag_fin) %>%
   summarise(n_ref = n()) %>%
-  ungroup() # should be 147 - why is this only 132? Because some countries do not have predictions within their EEZ for 2015-2017 (lack of data). Rhese will be gapfilled with the regional gapfilling? 
+  ungroup() # should be 147 - why is this only 131? Because some countries do not have predictions within their EEZ for 2015-2017 (lack of data). These will be gapfilled with the regional gapfilling? 
 
-# test <- qread(file.path(rdsi_dir, "prep/random_forest/eez_2015_2017_reference_cells_0/access_mask_2015_2017_BEN.qs"))
-# test <- qread(file.path(rdsi_dir, "prep/random_forest/predictions_all/yearly/model_preds_BEN_2017.qs")) # doesn't have any non zero predictions in BEN EEZ. Will use regional preds instead
+test <- qread(file.path(rdsi_dir, "prep/random_forest/eez_2015_2017_reference_cells_0/access_mask_2015_2017_BEN.qs"))
+test <- qread(file.path(rdsi_dir, "prep/random_forest/predictions_all/yearly/model_preds_BEN_2017.qs")) # doesn't have any non zero predictions in BEN EEZ. Will use regional preds instead
 
 # now calculate N_year,total
 ## for this we need to grab the effort for the corresponding years
@@ -680,7 +674,7 @@ years_to_run <- unique(data_to_run$year)
 cl <- makeCluster(38) 
 registerDoParallel(cl)
 
- foreach(flag = model_flags, .packages = c("dplyr", "tidyverse", "randomForest", "qs", "glue", "ranger", "terra")) %dopar% {
+ foreach(flag = flags_to_run, .packages = c("dplyr", "tidyverse", "randomForest", "qs", "glue", "ranger", "terra")) %dopar% {
 
  for(yr in years) {
 # flag = "JAM"
@@ -793,7 +787,7 @@ stopCluster(cl)
 
 pred_path <- file.path(rdsi_dir, "prep/random_forest/predictions_industrial_flag_revised_floor_depth/yearly/")
 pred_files <- list.files(pred_path, full.names = TRUE)
-pred_flags <- unique(sub(".*model_preds_([A-Z]{3})_.*", "\\1", pred_files)) # should be 132 - good
+pred_flags <- unique(sub(".*model_preds_([A-Z]{3})_.*", "\\1", pred_files)) # should be 131 - good
 
 length(unique(n_year_total_df$flag_fin)) == length(pred_flags) # TRUE - good
 
@@ -807,8 +801,8 @@ Combine all years for flag and save
     -  `nv = nominal_effort / (days_at_sea*mean_engine_p)`
  
 ```{r}
-library(strex)
-flags <- unique(str_after_nth(str_before_last(list.files(file.path("/home/ubuntu/data_storage/prep/random_forest/predictions_industrial_flag_revised_floor_depth/yearly")),"_"), "_", 2)) # 132 flags here, cool.
+
+flags <- unique(str_after_nth(str_before_last(list.files(file.path("/home/ubuntu/data_storage/prep/random_forest/predictions_industrial_flag_revised_floor_depth/yearly")),"_"), "_", 2)) # 131 flags here, cool.
 
 days_to_hours_conversion <- qs::qread(here("data/int/hours_to_days_conversion.qs")) %>%
   rename(lon = x, lat = y) %>%
@@ -870,7 +864,7 @@ test_preds <- qs::qread("/home/ubuntu/data_storage/prep/random_forest/prediction
 
 plot(test_preds)
 
-## earlier predictions might be TOO constricted now... But i think still better than before...
+## earlier predictions might be TOO constricted now... But still better than before...
 
 ```
 
@@ -902,8 +896,8 @@ years <- c(1950:2017)
 pixel_areas <- env_data %>%
   distinct(pixel_id, lon, lat, pixel_area_m2)
 
-# flag = "IDN"
-# yr = 1950
+flag = "IDN"
+yr = 1950
 
 # grab country level fishing effort data for flag and year
 model_data_flag <- hist_fish_data %>%
