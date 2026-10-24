@@ -70,20 +70,20 @@ model_data_train <- readRDS(here("data/model_features/prepared_data_1deg.rds")) 
 
 ## read in environmental variables
 
-  ocean_data_train <- read.csv(here("data/model_features/deg_1_x_1/errdap_chl.csv")) %>%
-      left_join(read.csv(here("data/model_features/deg_1_x_1/errdap_sst.csv")), by = c("pixel_id", "year")) %>% 
-      left_join(read.csv(here("data/model_features/deg_1_x_1/remss_wind.csv")), by = c("pixel_id", "year")) %>%
+  ocean_data_train <- qread(here("data/model_features/deg_1_x_1/errdap_chl.qs")) %>%
+      left_join(qread(here("data/model_features/deg_1_x_1/errdap_sst.qs")), by = c("pixel_id", "year")) %>% 
+      left_join(qread(here("data/model_features/deg_1_x_1/remss_wind.qs")), by = c("pixel_id", "year")) %>%
       filter(year %in% c(2015:2024))
 
 
   spatial_data_train <- spatial_data %>% 
    crossing(., year = c(2015:2024)) 
   
-  mpa_data_train <- qs::qread(here("data/model_features/deg_1_x_1/mpa/mpa_data_all.qs")) %>%
-    filter(year >= 2015)
+  # mpa_data_train <- qs::qread(here("data/model_features/deg_1_x_1/mpa/mpa_data_all.qs")) %>%
+  #   filter(year >= 2015)
   
   env_data_train <- spatial_data_train %>%
-    left_join(mpa_data_train) %>%
+  #  left_join(mpa_data_train) %>%
     left_join(ocean_data_train) %>% # cool.
     dplyr::select(-geometry_wkt) %>%
     left_join(elnino) %>%
@@ -117,9 +117,8 @@ Now read in data for predictions (1950-2024):
 ```{r}
 
   ocean_data_historical <- qs::qread(here("data/int/prediction_historical_data/one_degree/chl_yearly_1950_2014.qs")) %>%
-    dplyr::select(-pixel_area_m2) %>%
-  left_join(qs::qread(here("data/int/prediction_historical_data/one_degree/sst_yearly_1950_2014.qs")) %>%  dplyr::select(-pixel_area_m2), by = c("pixel_id", "year")) %>% 
-  left_join(qs::qread(here("data/int/prediction_historical_data/one_degree/wind_yearly_1950_2014.qs")) %>% mutate(year = as.numeric(year)) %>% dplyr::select(-pixel_area_m2), by = c("pixel_id", "year"))
+  left_join(qs::qread(here("data/int/prediction_historical_data/one_degree/sst_yearly_1950_2014.qs")), by = c("pixel_id", "year")) %>% 
+  left_join(qs::qread(here("data/int/prediction_historical_data/one_degree/wind_yearly_1950_2014.qs")) %>% mutate(year = as.numeric(year)), by = c("pixel_id", "year"))
 
   ocean_data_hist <- ocean_data_train %>%
     rbind(ocean_data_historical)
@@ -131,13 +130,13 @@ Now read in data for predictions (1950-2024):
     
   sea_ice_df <- qs::qread(here("data/model_features/deg_1_x_1/sea_ice_features_lit.qs"))
     
-  mpa_data <- qs::qread(here("data/model_features/deg_1_x_1/mpa/mpa_data_all.qs"))
+ # mpa_data <- qs::qread(here("data/model_features/deg_1_x_1/mpa/mpa_data_all.qs"))
   
   
   env_data_hist <- spatial_data_hist %>%
     left_join(sea_ice_df) %>%
     left_join(ocean_data_hist) %>% 
-    left_join(mpa_data) %>%
+  #  left_join(mpa_data) %>%
     left_join(elnino) %>%
     left_join(pdo) %>% 
     left_join(gfw_reception_data) %>%
@@ -196,7 +195,7 @@ We need:
 
 
 ```{r}
-flag           <- "AUS"
+flag           <- "CRI"
 hindcast_years <- 1950:2014            # industrial training = 2015-2024
 
 stage_1_model_dir <- file.path(rdsi_dir, "prep/random_forest/stage_1_models")   # final full-data models (v2 folder if you used one)
@@ -204,7 +203,8 @@ stage_2_model_dir <- file.path(rdsi_dir, "prep/random_forest/stage_2_models")
 stage_1_pred_dir  <- file.path(rdsi_dir, "prep/random_forest/predictions_all/yearly")
 stage_2_pred_dir  <- file.path(rdsi_dir, "prep/random_forest/predictions_all/yearly")
 
-effort_path <- file.path(rdsi_dir, "prep/random_forest/zenodo_data/mapped_industrial_effort_predictions_1950_2017.csv")   # FINAL constrained effort
+# effort_path <- file.path(rdsi_dir, "prep/random_forest/zenodo_data/mapped_industrial_effort_predictions_1950_2017.csv")   # FINAL constrained effort
+effort_path <- file.path(rdsi_dir, "prep/random_forest/predictions_industrial_flag_revised_floor_depth/model_preds_1950_2017_CRI.qs")   # FINAL constrained effort
 grid_path   <- here("data/model_features/deg_1_x_1/global_grid.csv")
 
 
@@ -369,7 +369,7 @@ aoa_vars_s2
 train_s1 %>%
   summarise(across(all_of(union(aoa_vars_s1, aoa_vars_s2)), ~ mean(.x == 0, na.rm = TRUE))) %>%
   pivot_longer(everything(), names_to = "var", values_to = "share_zero") %>%
-  arrange(desc(share_zero)) # ok looks fine. We did do a little bit of gapfilling but this looks OK. SST could in theory be 0 in places.
+  arrange(desc(share_zero)) # ok looks fine. We did do a little bit of gapfilling but this looks OK. 
 
 
 # ---- Step 4: historical predictor rows (from the saved prediction files) ----------
@@ -401,11 +401,12 @@ tic()
 aoa_s2 <- run_aoa(rf_s2, train_s2, hist_s2, aoa_vars_s2, "AUS industrial stage 2")   # small; use all rows
 toc()
 
-# Sensitivity of Stage 1 to the subsample size (report in SI): % in AOA should barely change
-tic()
-aoa_s1_b <- run_aoa(rf_s1, train_s1, hist_s1, aoa_vars_s1, "AUS stage 1 (n = 2500/yr)", max_train_per_year = 2500)
-toc()
-c(n5000 = mean(aoa_s1$hist$in_aoa), n2500 = mean(aoa_s1_b$hist$in_aoa))
+# # Sensitivity of Stage 1 to the subsample size (report in SI): % in AOA should barely change
+# tic()
+# aoa_s1_b <- run_aoa(rf_s1, train_s1, hist_s1, aoa_vars_s1, "AUS stage 1 (n = 2500/yr)", max_train_per_year = 2500)
+# toc()
+# c(n5000 = mean(aoa_s1$hist$in_aoa), n2500 = mean(aoa_s1_b$hist$in_aoa))
+## ok using 5000 vs 2500 doesnt really change the % in AOA. That's good. 
 
 aoa_s1$threshold
 aoa_s2$threshold
@@ -487,7 +488,7 @@ range_check(aoa_s2, "Stage 2") %>% print(n = Inf)
 
 # ---- Step 8: effort-weighted AOA (the headline number) -------------------------------
 
-effort <- fread(effort_path) %>%
+effort <- qread(effort_path) %>%
   filter(flag_country_iso3c == flag, year %in% hindcast_years) %>%   # edit column names to match your file
   left_join(global_grid %>%
               dplyr::select(-geometry_wkt)) %>%
@@ -593,7 +594,7 @@ drop_sets <- list(
   env_sd  = c("sst_c_sd", "chl_mg_per_m3_sd", "wind_speed_ms_sd"),
   env_all = c("sst_c_mean", "sst_c_sd", "chl_mg_per_m3_mean", "chl_mg_per_m3_sd",
               "wind_speed_ms_mean", "wind_speed_ms_sd"),
-  mpa     = c("nearest_mpa_distance_m", "nearest_mpa_years_since_designation"),
+#  mpa     = c("nearest_mpa_distance_m", "nearest_mpa_years_since_designation"),
   climate = c("enso_index_mean", "enso_index_sd", "pdo_index_mean", "pdo_index_sd")
 )
 
@@ -619,7 +620,7 @@ ablation %>% pivot_wider(names_from = year, values_from = pct_in_aoa)
 ## Ok, so what I think all of this is telling me is that the primary culprit is the MPA variables. It is likely these don't really add too much to the modelling anyways, so we should consider dropping them. And 2) re-do the bias correction. 
 
 
-test_mpa <- hist_s1 %>% group_by(year) %>% summarise(median(nearest_mpa_distance_m)) # DI drops sharply in 1971 and 2004, corresponding with MPA designations near AUS fishing grounds. so MPA is pretty much the whole reason for the DI being high. 
+# test_mpa <- hist_s1 %>% group_by(year) %>% summarise(median(nearest_mpa_distance_m)) # DI drops sharply in 1971 and 2004, corresponding with MPA designations near AUS fishing grounds. so MPA is pretty much the whole reason for the DI being high. 
 
 # This is more than an AOA issue. In 2015–2024, nearly every cell is relatively close to some MPA. In 1950 there were hardly any, so distances are far larger than anything seen in training. A random forest can’t extrapolate, so every historical cell gets treated as though it sits at the most remote MPA distance in the training data. Those leaves were learned from very different places, such as mid-ocean cells. So the MPA variables may be feeding the historical predictions values with no meaning, and on this point the reviewer is right.
 

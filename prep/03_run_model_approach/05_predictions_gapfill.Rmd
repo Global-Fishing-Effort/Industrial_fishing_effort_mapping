@@ -57,15 +57,14 @@ model_data <- readRDS(here("data/model_features/prepared_data_1deg.rds")) %>%
 
   global_grid <- read.csv(here("data/model_features/deg_1_x_1/global_grid.csv"))
   
-  ocean_data <- read.csv(here("data/model_features/deg_1_x_1/errdap_chl.csv")) %>%
-  left_join(read.csv(here("data/model_features/deg_1_x_1/errdap_sst.csv")), by = c("pixel_id", "year")) %>% 
-  left_join(read.csv(here("data/model_features/deg_1_x_1/remss_wind.csv")), by = c("pixel_id", "year")) %>%
+  ocean_data <- qread(here("data/model_features/deg_1_x_1/errdap_chl.qs")) %>%
+  left_join(qread(here("data/model_features/deg_1_x_1/errdap_sst.qs")), by = c("pixel_id", "year")) %>% 
+  left_join(qread(here("data/model_features/deg_1_x_1/remss_wind.qs")), by = c("pixel_id", "year")) %>%
   filter(year %in% c(2015:2024)) 
   
   ocean_data_historical <- qs::qread(here("data/int/prediction_historical_data/one_degree/chl_yearly_1950_2014.qs")) %>%
-    dplyr::select(-pixel_area_m2) %>%
-  left_join(qs::qread(here("data/int/prediction_historical_data/one_degree/sst_yearly_1950_2014.qs")) %>%  dplyr::select(-pixel_area_m2), by = c("pixel_id", "year")) %>% 
-  left_join(qs::qread(here("data/int/prediction_historical_data/one_degree/wind_yearly_1950_2014.qs")) %>% mutate(year = as.numeric(year)) %>% dplyr::select(-pixel_area_m2), by = c("pixel_id", "year"))
+  left_join(qs::qread(here("data/int/prediction_historical_data/one_degree/sst_yearly_1950_2014.qs")), by = c("pixel_id", "year")) %>% 
+  left_join(qs::qread(here("data/int/prediction_historical_data/one_degree/wind_yearly_1950_2014.qs")) %>% mutate(year = as.numeric(year)), by = c("pixel_id", "year"))
 
   # why are there some NAs? They are at the poles; southern ocean and arctic. Probably don't need to worry about these for most countries.
 
@@ -85,12 +84,12 @@ model_data <- readRDS(here("data/model_features/prepared_data_1deg.rds")) %>%
 
       sea_ice_df <- qs::qread(here("data/model_features/deg_1_x_1/sea_ice_features_lit.qs"))
       
-        mpa_data <- qs::qread(here("data/model_features/deg_1_x_1/mpa/mpa_data_all.qs")) 
+      #  mpa_data <- qs::qread(here("data/model_features/deg_1_x_1/mpa/mpa_data_all.qs")) 
 
   env_data <- spatial_data %>%
             left_join(sea_ice_df) %>%
     left_join(ocean_data_all) %>% # cool.
-    left_join(mpa_data) %>% 
+   # left_join(mpa_data) %>% 
     left_join(elnino) %>%
     left_join(pdo) %>%
     left_join(gfw_reception_data) %>%
@@ -276,7 +275,7 @@ First lets check to see what predictions need to be gapfilled. We'll do this by 
 
   all_files_flag <- list.files(file.path(rdsi_dir, "prep/random_forest/predictions_industrial_flag_revised_floor_depth/"), full.names = TRUE)
 
-    all_data <- lapply(all_files_flag[-133], qread) %>%
+    all_data <- lapply(all_files_flag[-134], qread) %>%
       bind_rows()
 
 all_data_grouped_2 <- all_data %>% 
@@ -353,22 +352,6 @@ sample_size_flags <- model_data %>%
 
 flags_missing_fin <- unique(c(flags_missing, sample_size_flags))
 
-old_missing <- c(
-  "DOM", "RAA", "RAM", "LBN", "BHS", "WLF", "GLP", "TGO", "MYT", "BEN",
-  "STP", "IRQ", "SYR", "JAM", "LCA", "DJI", "GTM", "GUF", "COG", "GAB",
-  "BGD", "BRN", "COD", "CUB", "GMB", "GNB", "GNQ", "GUY", "KWT", "MDG",
-  "MNE", "ROU", "SUR", "SVN", "TON"
-)
-
-setdiff(flags_missing_fin, old_missing) # HND, BLZ, we will rerun 
-
-test <- hist_fish_data %>%
-  filter(flag_fin %in% c(flags_missing_fin)) %>%
-  pull(flag_country_name) %>%
-  unique()
-
-
-sort(test)
 
 ```
 
@@ -439,7 +422,7 @@ doParallel::registerDoParallel(cl)
 
 res <- foreach(flag = flags_to_run, .errorhandling = "pass", .inorder = FALSE) %dopar% {
 
-  # flag = "CUB"
+  # flag = "BEN"
   hist_flag <- hist_by_flag[[flag]]
 
   regional_name <- if (flag == "STP") "SubAfrica" else unique(hist_flag$region)

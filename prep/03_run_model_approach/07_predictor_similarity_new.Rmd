@@ -1,0 +1,702 @@
+---
+title: "Area of applicability (AOA) for all industrial flag models"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+```
+
+## Summary
+
+Computes the dissimilarity index (DI) and area of applicability (AOA; Meyer & Pebesma 2021, https://doi.org/10.1111/2041-210X.13650) for every industrial flag model, Stage 1 (presence) and Stage 2 (intensity), then pools the results globally.
+
+Same method as the AUS test (also checked on USA and CRI):
+
+ - Training data = the full data used to fit each final model (2015-2024); historical rows = the pixel-years in the saved Stage 1/2 prediction files (1950-2014), with predictors joined back from the prediction data-prep table.
+ - Predictors excluded from the DI: year (always out of range), AIS reception (observation process), and all categorical/ID variables (handled separately: fleet strata in Step 9, year in Step 10).
+ - Weights = Gini importance of the final model; threshold from leave-one-year-out folds.
+ - Stage 1 training rows are subsampled within year (`max_train_per_year`), because `trainDI` scales ~quadratically. AUS: 5000 vs 2500 per year gave 11.06% vs 11.15% of cells in the AOA.
+ - Effort weighting uses the FINAL allocated effort (after all constraints).
+
+Each flag's outputs are saved to `<out_dir>/flags/<FLAG>/`. `meta.qs` is written last, so a flag with `meta.qs` status `"ok"` is complete, and re-running skips it.
+
+Regional gap-fill models (~30 flags, <1% of effort) are not assessed; the combine step reports what share of all industrial effort was covered.
+
+## Setup
+
+```{r libraries}
+library(tidyverse)
+library(CAST)      # >= 1.0
+library(ranger)
+library(qs)
+library(glue)
+library(here)
+library(foreach)
+library(doParallel)
+library(janitor)
+library(countrycode)
+library(data.table)
+
+source(here("R/dir.R"))
+
+
+## these don't change across training and prediciton data:
+global_grid <- read.csv(here("data/model_features/deg_1_x_1/global_grid.csv"))
+
+spatial_data <- global_grid %>%
+    left_join(read.csv(here("data/model_features/deg_1_x_1/gfw_static_spatial_measures.csv")) %>% dplyr::select(-lat, -lon), by = "pixel_id") %>%
+   left_join(read.csv(here("data/model_features/deg_1_x_1/mesopelagiczones/mesopelagiczones_fixed.csv")), by = "pixel_id") %>%
+   left_join(read.csv(here("data/model_features/deg_1_x_1/eez/eez_fix.csv")), by = "pixel_id") %>%
+   left_join(read.csv(here("data/model_features/deg_1_x_1/fao/fao_fixed.csv")), by = "pixel_id") %>%
+   left_join(read.csv(here("data/model_features/deg_1_x_1/oceans_fixed.csv")), by = "pixel_id") %>%
+    left_join(read.csv(here("data/model_features/deg_1_x_1/seamounts.csv")), by = "pixel_id")
+
+  gfw_reception_data <- read.csv(here("data/model_features/deg_1_x_1/gfw_reception_quality.csv"))
+
+```
+
+## Settings
+
+Edit paths, the effort file's column names (in the `inputs` chunk), and `regional_flags`.
+
+```{r settings}
+hindcast_years     <- 1950:2014     # industrial training = 2015-2024
+max_train_per_year <- 5000          # Stage 1 subsample within year
+sens_target_years  <- c(1960, 1990) # Step 10; nearest available year is used if missing
+sens_set_years     <- c(2015, 2019, 2024)
+n_workers          <- 30
+overwrite          <- FALSE         # TRUE = re-run flags that already finished
+save_plots         <- TRUE          # per-flag DI and effort plots
+
+stage_1_model_dir <- file.path(rdsi_dir, "prep/random_forest/stage_1_models")
+stage_2_model_dir <- file.path(rdsi_dir, "prep/random_forest/stage_2_models")
+stage_1_pred_dir  <- file.path(rdsi_dir, "prep/random_forest/predictions_all/yearly")
+stage_2_pred_dir  <- file.path(rdsi_dir, "prep/random_forest/predictions_all/yearly")
+
+effort_path   <- file.path(rdsi_dir, "prep/random_forest/zenodo_data/mapped_industrial_effort_predictions_1950_2017.csv")   # FINAL constrained effort
+rousseau_path <- here("data/int/rousseau_gear_fix.qs")
+
+out_dir <- file.path(rdsi_dir, "prep/aoa/industrial")
+dir.create(file.path(out_dir, "flags"), recursive = TRUE, showWarnings = FALSE)
+log_file <- file.path(out_dir, "aoa_log.txt")
+
+# flags allocated with regional gap-fill models (not assessed)
+regional_flags <- c()   # fill in from your gap-filling script
+
+excl_vars <- c("year",
+               "ais_reception_positions_per_day_class_A",
+               "ais_reception_positions_per_day_class_B",
+               "gear", "length_category",
+               "eez_id", "fao_id", "meso_id", "ocean",
+               "eez_region_world_bank_7", "gov_score")
+```
+
+## Load the training and prediction data
+
+Paste (or `source()`) your CURRENT data-prep chunks here, with distinct names, INCLUDING the factor encoding, the MPA-free predictor set and the per-cell bias-corrected historical data:
+
+ - Stage 1 model script chunk (2015-2024): `model_data_train`, `env_data_train`, `env_grid_train`, `gfw_reception_data`
+ - Prediction script chunk (1950-2024): `env_data_fishing_areas_hist`
+
+```{r load-data}
+# ... training data-prep chunk (renamed objects) ...
+elnino <- read.csv(here("data/model_features/enso_index.csv"))
+
+pdo <- read.csv(here("data/model_features/pdo_index.csv")) 
+
+world_bank <- read.csv(here("data/model_features/world_bank_regions.csv")) 
+
+gfi_df <- read.csv(here("data/model_features/global_fishing_index_governance.csv"))
+
+# Load prepared data
+model_data_train <- readRDS(here("data/model_features/prepared_data_1deg.rds")) %>%
+  mutate(year = as.numeric(year)) %>%
+  mutate(presence = 1) %>%
+   mutate(length_category = factor(length_category,
+                                  levels = c("Less than 6m", "6-12m", "12-24m", "24-50m", "Over 50m"),          # your classes, smallest to largest
+                                  ordered = TRUE),
+          gear            = factor(gear))
+
+## read in environmental variables
+
+  ocean_data_train <- qread(here("data/model_features/deg_1_x_1/errdap_chl.qs")) %>%
+      left_join(qread(here("data/model_features/deg_1_x_1/errdap_sst.qs")), by = c("pixel_id", "year")) %>% 
+      left_join(qread(here("data/model_features/deg_1_x_1/remss_wind.qs")), by = c("pixel_id", "year")) %>%
+      filter(year %in% c(2015:2024))
+
+
+  spatial_data_train <- spatial_data %>% 
+   crossing(., year = c(2015:2024)) 
+  
+  # mpa_data_train <- qs::qread(here("data/model_features/deg_1_x_1/mpa/mpa_data_all.qs")) %>%
+  #   filter(year >= 2015)
+  
+  env_data_train <- spatial_data_train %>%
+  #  left_join(mpa_data_train) %>%
+    left_join(ocean_data_train) %>% # cool.
+    dplyr::select(-geometry_wkt) %>%
+    left_join(elnino) %>%
+    left_join(pdo) %>%
+    left_join(world_bank, by = c("eez_id")) %>%
+    mutate(eez_region_world_bank_7 = ifelse(eez_sovereign %in% c("High seas", "Land"), "High seas", eez_region_world_bank_7)) %>% 
+    left_join(gfi_df, by = c("eez_sovereign" = "flag_fin")) %>% # add in global fishing index data here
+    mutate(gov_score = ifelse(eez_id >= 99999 & is.na(gov_score), "high_seas", gov_score)) %>%
+        mutate(gov_score = ifelse(eez_id < 99999 & is.na(gov_score), "no_data", gov_score)) %>%
+    dplyr::select(-eez_sovereign, -nearest_seamount_id) %>% 
+    distinct() %>%
+     mutate(
+    eez_id  = factor(eez_id),
+    fao_id  = factor(fao_id),
+    meso_id = factor(meso_id),
+     eez_region_world_bank_7 = factor(eez_region_world_bank_7),
+       ocean     = factor(ocean),
+    # ordinal: keep the score order; sentinels sit at the low end so one split isolates them
+    gov_score = factor(gov_score, levels = c("no_data", "high_seas", as.character(0:10)), ordered = TRUE)
+  )
+
+  
+env_grid_train <- env_data_train %>% 
+  dplyr::select(lon, lat) %>% distinct()
+
+# ... prediction data-prep chunk (renamed objects) ...
+
+ ocean_data_historical <- qs::qread(here("data/int/prediction_historical_data/one_degree/chl_yearly_1950_2014.qs")) %>%
+  left_join(qs::qread(here("data/int/prediction_historical_data/one_degree/sst_yearly_1950_2014.qs")), by = c("pixel_id", "year")) %>% 
+  left_join(qs::qread(here("data/int/prediction_historical_data/one_degree/wind_yearly_1950_2014.qs")) %>% mutate(year = as.numeric(year)), by = c("pixel_id", "year"))
+
+  ocean_data_hist <- ocean_data_train %>%
+    rbind(ocean_data_historical)
+
+
+  spatial_data_hist <- spatial_data %>%
+   crossing(., year = c(1950:2024)) 
+
+    
+  sea_ice_df <- qs::qread(here("data/model_features/deg_1_x_1/sea_ice_features_lit.qs"))
+    
+ # mpa_data <- qs::qread(here("data/model_features/deg_1_x_1/mpa/mpa_data_all.qs"))
+  
+  
+  env_data_hist <- spatial_data_hist %>%
+    left_join(sea_ice_df) %>%
+    left_join(ocean_data_hist) %>% 
+  #  left_join(mpa_data) %>%
+    left_join(elnino) %>%
+    left_join(pdo) %>% 
+    left_join(gfw_reception_data) %>%
+    left_join(world_bank, by = c("eez_id")) %>%
+    mutate(eez_region_world_bank_7 = ifelse(eez_sovereign %in% c("High seas", "Land"), "High seas", eez_region_world_bank_7)) %>% 
+    left_join(gfi_df, by = c("eez_sovereign" = "flag_fin")) %>% # add in global fishing index data here
+    mutate(gov_score = ifelse(eez_id >= 99999 & is.na(gov_score), "high_seas", gov_score)) %>%
+        mutate(gov_score = ifelse(eez_id < 99999 & is.na(gov_score), "no_data", gov_score)) %>%
+    dplyr::select(-eez_sovereign, -nearest_seamount_id) %>% 
+    distinct()  %>%
+    dplyr::select(-geometry_wkt) %>%
+         mutate(
+    eez_id  = factor(eez_id),
+    fao_id  = factor(fao_id),
+    meso_id = factor(meso_id),
+     eez_region_world_bank_7 = factor(eez_region_world_bank_7),
+       ocean     = factor(ocean),
+    # ordinal: keep the score order; sentinels sit at the low end so one split isolates them
+    gov_score = factor(gov_score, levels = c("no_data", "high_seas", as.character(0:10)), ordered = TRUE)
+  )
+  
+  
+  
+eez_lookup <- read.csv(here("data/model_features/deg_1_x_1/eez/eez_lookup_fix.csv")) %>%
+  clean_names() %>%
+  mutate(eez_country_name = countrycode(eez_sovereign, origin = "iso3c", destination = "country.name")) %>%
+    mutate(eez_country_name = case_when(
+    eez_sovereign == "RAA" ~ "Azores", 
+    eez_sovereign == "RAM" ~ "Madeira",
+    TRUE ~ eez_country_name
+  )) %>%
+  mutate(eez_country_name = ifelse(is.na(eez_country_name), "High seas", eez_country_name)) %>%
+  mutate(eez_id = as.factor(eez_id))
+
+
+env_data_fishing_areas_hist <- env_data_hist %>% 
+  filter(sea_ice_present == 0) %>%
+      left_join(eez_lookup)
+
+env_grid_fishing_areas_hist <- env_data_fishing_areas_hist %>% 
+  dplyr::select(lon, lat) %>% 
+  distinct()
+
+
+required <- c("model_data_train", "env_data_train", "env_grid_train",
+              "gfw_reception_data", "env_data_fishing_areas_hist")
+missing_objs <- required[!vapply(required, exists, logical(1))]
+if (length(missing_objs) > 0) stop("Load these first: ", paste(missing_objs, collapse = ", "))
+```
+
+## Inputs read once
+
+These are shared with the forked workers.
+
+```{r inputs}
+hist_env <- env_data_fishing_areas_hist
+
+effort_all <- fread(effort_path) %>%
+  filter(year %in% hindcast_years) %>%  # edit column names to match your file
+  left_join(global_grid) %>%
+  group_by(flag_fin = flag_country_iso3c, pixel_id, year) %>%
+  summarise(effort = sum(nom_active_fishing_hours, na.rm = TRUE), .groups = "drop") %>%   # edit effort column name
+  filter(effort > 0)
+
+effort_by_flag <- split(effort_all, effort_all$flag_fin)
+
+rousseau_ind <- qs::qread(rousseau_path) %>%
+  filter(sector == "I", year %in% hindcast_years) %>%
+  group_by(flag_fin = country, year, gear = gear_new, length_category) %>%
+  summarise(effort = sum(eff_active_hours, na.rm = TRUE), .groups = "drop") %>%
+  mutate(across(c(gear, length_category), as.character))
+
+flags_from_files <- function(dir, stage) {
+  f <- list.files(dir, pattern = glue("^stage_{stage}_rf_model_full_data_[A-Z]{{3}}_\\d+\\.qs$"))
+  sub(glue("^stage_{stage}_rf_model_full_data_([A-Z]{{3}})_.*"), "\\1", f)
+}
+model_flags <- intersect(flags_from_files(stage_1_model_dir, 1), flags_from_files(stage_2_model_dir, 2))
+model_flags <- setdiff(model_flags, regional_flags)
+length(model_flags)
+```
+
+## Helper functions
+
+`build_train()` builds the training data at pixel-year level. The AOA predictors don't vary by gear/length, so this matches the stratum-level table the model saw (after de-duplication), without building grid × strata × years (very large for CHN/USA). The row counts the model saw are reconstructed for the `num.samples` check.
+
+```{r helpers}
+read_final_model <- function(dir, stage, flag) {
+  f <- list.files(dir, pattern = glue("^stage_{stage}_rf_model_full_data_{flag}_\\d+\\.qs$"), full.names = TRUE)
+  if (length(f) != 1) stop("Expected 1 final model file for stage ", stage, " ", flag, ", found ", length(f))
+  qs::qread(f)
+}
+
+get_aoa_vars <- function(rf, train, excl_vars) {
+  cand <- setdiff(rf$forest$independent.variable.names, excl_vars)
+  cand[vapply(train[cand], is.numeric, logical(1))]
+}
+
+build_train <- function(flag) {
+  mdf <- model_data_train %>%
+    dplyr::select(lon, lat, flag_fin, gear, length_category, year, presence) %>%
+    filter(flag_fin == flag) %>%
+    distinct()
+  cats <- mdf %>% distinct(year, gear, length_category)
+
+  px <- tidyr::crossing(env_grid_train, year = unique(cats$year)) %>%
+    left_join(env_data_train, by = c("lon", "lat", "year")) %>%
+    left_join(gfw_reception_data) %>%     # same join as the model script
+    na.omit() %>%
+    distinct()
+
+  fished <- mdf %>% semi_join(px, by = c("lon", "lat", "year"))
+
+  n_s1_expected <- px %>% count(year, name = "n_px") %>%
+    inner_join(cats %>% count(year, name = "n_cats"), by = "year") %>%
+    summarise(n = sum(n_px * n_cats)) %>% pull(n)
+
+  list(s1            = px,
+       s2            = px %>% semi_join(fished, by = c("lon", "lat", "year")),
+       n_s1_expected = n_s1_expected,
+       n_s2_expected = nrow(fished),
+       strata_seen   = fished %>% distinct(gear, length_category) %>%
+                         mutate(across(everything(), as.character), seen = TRUE))
+}
+
+read_preds <- function(pred_dir, flag, yrs, vars, hist_env) {
+  keys <- map_dfr(yrs, \(yr) {
+    f <- file.path(pred_dir, glue("model_preds_{flag}_{yr}.qs"))
+    if (!file.exists(f)) return(NULL)
+    qs::qread(f) %>% distinct(pixel_id, lon, lat, year)
+  })
+  if (nrow(keys) == 0) stop("no historical prediction files found in ", pred_dir)
+
+  keys %>%
+    left_join(hist_env %>%
+                filter(year %in% yrs) %>%
+                select(lon, lat, year, all_of(vars)) %>%
+                distinct(),
+              by = c("lon", "lat", "year"))
+}
+
+read_full_pred_rows <- function(pred_dir, flag, yr, hist_env) {
+  d <- qs::qread(file.path(pred_dir, glue("model_preds_{flag}_{yr}.qs")))
+  missing <- setdiff(names(hist_env), names(d))
+  d %>% left_join(hist_env %>% filter(year == yr) %>% select(lon, lat, year, all_of(missing)) %>% distinct(),
+                  by = c("lon", "lat", "year"))
+}
+
+pred_years_available <- function(pred_dir, flag, yrs) {
+  yrs[file.exists(file.path(pred_dir, glue("model_preds_{flag}_{yrs}.qs")))]
+}
+
+run_aoa <- function(rf, train, newdata, aoa_vars, label, max_train_per_year = Inf, seed = 123) {
+  imp <- rf$variable.importance[aoa_vars]
+  if (is.null(imp) || anyNA(imp)) stop(label, ": missing variable importance in final model")
+  imp[imp < 0] <- 0
+
+  tr <- train   %>% select(pixel_id, year, all_of(aoa_vars)) %>% drop_na() %>% distinct()
+  nd <- newdata %>% select(pixel_id, year, all_of(aoa_vars)) %>% drop_na() %>% distinct()
+
+  if (is.finite(max_train_per_year)) {
+    set.seed(seed)
+    tr <- tr %>% group_by(year) %>% slice_sample(n = max_train_per_year) %>% ungroup()
+  }
+
+  tdi <- trainDI(train = tr[, aoa_vars], weight = as.data.frame(t(imp)),
+                 CVtest = as.integer(factor(tr$year)), algorithm = "kd_tree", verbose = FALSE)
+  a   <- aoa(newdata = nd[, aoa_vars], trainDI = tdi, algorithm = "kd_tree", verbose = FALSE)
+
+  list(vars       = aoa_vars,
+       weights    = imp,
+       threshold  = tdi$threshold,
+       n_train    = nrow(tr),
+       n_hist     = nrow(nd),
+       bench      = tr %>% select(pixel_id, year) %>% mutate(DI = tdi$trainDI, in_aoa = DI <= tdi$threshold),
+       hist       = nd %>% select(pixel_id, year) %>% mutate(DI = a$DI, in_aoa = a$AOA == 1),
+       train_vals = tr,
+       hist_vals  = nd)
+}
+
+range_check <- function(res, label) {
+  rng <- res$train_vals %>%
+    summarise(across(all_of(res$vars), list(lo = min, hi = max))) %>%
+    pivot_longer(everything(), names_to = c("var", ".value"), names_pattern = "(.*)_(lo|hi)$")
+
+  res$hist_vals %>%
+    mutate(decade = 10 * floor(year / 10)) %>%
+    pivot_longer(all_of(res$vars), names_to = "var") %>%
+    left_join(rng, by = "var") %>%
+    group_by(var, decade) %>%
+    summarise(pct_outside_range = 100 * mean(value < lo | value > hi), .groups = "drop") %>%
+    mutate(stage = label, importance = unname(res$weights[var]), .before = 1)   # long format: easy to combine
+}
+
+# Step 10, robust to missing years: uses the available historical year nearest each target
+year_sensitivity <- function(rf, pred_dir, flag, hist_years, set_years, stage) {
+  map_dfr(hist_years, \(hy) {
+    d <- read_full_pred_rows(pred_dir, flag, hy, hist_env)
+    if (nrow(d) == 0) return(NULL)
+    preds <- map(set_years, \(sy) {
+      p <- predict(rf, data = mutate(d, year = sy), num.threads = 1)$predictions
+      if (stage == 1) p[, "1"] else p
+    })
+    names(preds) <- paste0("y", set_years)
+    as_tibble(preds) %>%
+      summarise(across(-1, ~ suppressWarnings(cor(.x, preds[[1]], method = "spearman")))) %>%
+      mutate(stage = stage, hist_year = hy, reference = names(preds)[1], n_rows = nrow(d), .before = 1)
+  })
+}
+
+slim <- function(res) res[setdiff(names(res), c("train_vals", "hist_vals"))]
+
+log_line <- function(...) cat(format(Sys.time(), "%F %T"), ..., "\n", file = log_file, append = TRUE)
+```
+
+## One flag: Steps 1-10
+
+Every table is saved to `<out_dir>/flags/<FLAG>/`. Step 8 keeps effort SUMS (not just %) so flags can be pooled globally; effort with no AOA row (e.g. years allocated by a regional model) is counted as unassessed and excluded from the %.
+
+```{r run-flag-function}
+run_flag <- function(flag) {
+  # flag = "AUS"
+  fdir <- file.path(out_dir, "flags", flag)
+  dir.create(fdir, recursive = TRUE, showWarnings = FALSE)
+  save <- function(x, name) qs::qsave(x, file.path(fdir, paste0(name, ".qs")))
+  t0 <- Sys.time()
+
+  # Step 1-2: models and training data
+  rf_s1 <- read_final_model(stage_1_model_dir, 1, flag)
+  rf_s2 <- read_final_model(stage_2_model_dir, 2, flag)
+  tr <- build_train(flag)
+
+  # Step 3-4: predictors and historical rows
+  aoa_vars_s1 <- get_aoa_vars(rf_s1, tr$s1, excl_vars)
+  aoa_vars_s2 <- get_aoa_vars(rf_s2, tr$s2, excl_vars)
+  if (length(aoa_vars_s1) < 2 || length(aoa_vars_s2) < 2) stop("fewer than 2 numeric AOA predictors")
+
+  hist_s1 <- read_preds(stage_1_pred_dir, flag, hindcast_years, aoa_vars_s1, hist_env)
+  hist_s2 <- read_preds(stage_2_pred_dir, flag, hindcast_years, aoa_vars_s2, hist_env)
+
+  # Step 5: AOA
+  aoa_s1 <- run_aoa(rf_s1, tr$s1, hist_s1, aoa_vars_s1, glue("{flag} stage 1"), max_train_per_year)
+  aoa_s2 <- run_aoa(rf_s2, tr$s2, hist_s2, aoa_vars_s2, glue("{flag} stage 2"))
+  save(slim(aoa_s1), "aoa_stage1")
+  save(slim(aoa_s2), "aoa_stage2")
+
+  # Step 6: DI by year, with training benchmark
+  di_all <- bind_rows(
+    aoa_s1$bench %>% mutate(stage = "Stage 1", period = "training (leave-year-out)"),
+    aoa_s1$hist  %>% mutate(stage = "Stage 1", period = "historical"),
+    aoa_s2$bench %>% mutate(stage = "Stage 2", period = "training (leave-year-out)"),
+    aoa_s2$hist  %>% mutate(stage = "Stage 2", period = "historical")
+  ) %>% mutate(flag = flag, .before = 1)
+  di_year <- di_all %>%
+    group_by(flag, stage, period, year) %>%
+    summarise(n_cells = n(), pct_cells_in_aoa = 100 * mean(in_aoa), median_DI = median(DI), .groups = "drop")
+  save(di_all, "di_all")
+  save(di_year, "di_year")
+
+  # Step 7: range check
+  rc <- bind_rows(range_check(aoa_s1, "Stage 1"), range_check(aoa_s2, "Stage 2")) %>%
+    mutate(flag = flag, .before = 1)
+  save(rc, "range_check")
+
+  # Step 8: effort-weighted AOA
+  eff <- effort_by_flag[[flag]]
+  if (is.null(eff)) eff <- tibble(flag_fin = character(), pixel_id = integer(), year = numeric(), effort = numeric())
+  aoa_effort <- eff %>%
+    left_join(aoa_s1$hist %>% select(pixel_id, year, in_s1 = in_aoa), by = c("pixel_id", "year")) %>%
+    left_join(aoa_s2$hist %>% select(pixel_id, year, in_s2 = in_aoa), by = c("pixel_id", "year")) %>%
+    group_by(year) %>%
+    summarise(effort_total    = sum(effort),
+              effort_assessed = sum(effort[!is.na(in_s1) & !is.na(in_s2)]),
+              effort_in_s1    = sum(effort[in_s1 %in% TRUE]),
+              effort_in_s2    = sum(effort[in_s2 %in% TRUE]),
+              effort_in_both  = sum(effort[in_s1 %in% TRUE & in_s2 %in% TRUE]),
+              .groups = "drop") %>%
+    mutate(pct_effort_s1   = 100 * effort_in_s1 / effort_assessed,
+           pct_effort_s2   = 100 * effort_in_s2 / effort_assessed,
+           pct_effort_both = 100 * effort_in_both / effort_assessed,
+           pct_unassessed  = 100 * (effort_total - effort_assessed) / effort_total,
+           flag = flag, .before = 1)
+  save(aoa_effort, "aoa_effort")
+
+  # Step 9: fleet composition
+  strata_check <- rousseau_ind %>%
+    filter(flag_fin == flag) %>%
+    left_join(tr$strata_seen, by = c("gear", "length_category")) %>%
+    mutate(seen = !is.na(seen))
+  strata_summary <- strata_check %>%
+    group_by(flag_fin, year) %>%
+    summarise(effort_total = sum(effort), effort_unseen = sum(effort[!seen]),
+              pct_effort_unseen_strata = 100 * effort_unseen / effort_total, .groups = "drop")
+  save(strata_check, "strata_check")
+  save(strata_summary, "strata_summary")
+
+  # Step 10: year sensitivity on available years only
+  avail <- intersect(pred_years_available(stage_1_pred_dir, flag, hindcast_years),
+                     pred_years_available(stage_2_pred_dir, flag, hindcast_years))
+  sens_years <- if (length(avail) > 0) unique(vapply(sens_target_years, \(t) avail[which.min(abs(avail - t))], numeric(1))) else numeric()
+  ysens <- if (length(sens_years) > 0) {
+    bind_rows(year_sensitivity(rf_s1, stage_1_pred_dir, flag, sens_years, sens_set_years, 1),
+              year_sensitivity(rf_s2, stage_2_pred_dir, flag, sens_years, sens_set_years, 2)) %>%
+      mutate(flag = flag, .before = 1)
+  } else tibble(flag = flag)
+  save(ysens, "year_sensitivity")
+
+  # optional plots
+  if (save_plots) {
+    thr <- tibble(stage = c("Stage 1", "Stage 2"), threshold = c(aoa_s1$threshold, aoa_s2$threshold))
+    p_di <- ggplot(di_all, aes(factor(year), DI, fill = period)) +
+      geom_boxplot(outlier.size = 0.2, linewidth = 0.2) +
+      geom_hline(data = thr, aes(yintercept = threshold), linetype = 2) +
+      facet_wrap(~stage, ncol = 1, scales = "free_y") +
+      scale_x_discrete(breaks = as.character(seq(1950, 2024, 10))) +
+      labs(x = NULL, y = "DI", fill = NULL, title = glue("{flag} industrial: DI by year (dashed = AOA threshold)")) +
+      theme_bw() + theme(legend.position = "bottom")
+    ggsave(file.path(fdir, "di_by_year.png"), p_di, width = 10, height = 7)
+
+    if (nrow(aoa_effort) > 0) {
+      p_eff <- aoa_effort %>%
+        select(year, `Stage 1` = pct_effort_s1, `Stage 2` = pct_effort_s2, `Both stages` = pct_effort_both) %>%
+        pivot_longer(-year, names_to = "metric", values_to = "pct") %>%
+        ggplot(aes(year, pct, colour = metric)) + geom_line() +
+        scale_y_continuous(limits = c(0, 100)) +
+        labs(x = NULL, y = "% of allocated effort inside AOA", colour = NULL, title = glue("{flag} industrial")) +
+        theme_bw()
+      ggsave(file.path(fdir, "aoa_effort.png"), p_eff, width = 8, height = 4)
+    }
+  }
+
+  # meta LAST: its presence with status "ok" marks the flag as complete
+  meta <- tibble(
+    flag = flag, status = "ok", error = NA_character_,
+    n_train_s1_model = rf_s1$num.samples, n_train_s1_expected = tr$n_s1_expected,
+    n_train_s2_model = rf_s2$num.samples, n_train_s2_expected = tr$n_s2_expected,
+    rowcheck_s1 = rf_s1$num.samples == tr$n_s1_expected,
+    rowcheck_s2 = rf_s2$num.samples == tr$n_s2_expected,
+    n_train_px_s1 = aoa_s1$n_train, n_train_px_s2 = aoa_s2$n_train,
+    n_hist_px_s1 = aoa_s1$n_hist, n_hist_px_s2 = aoa_s2$n_hist,
+    n_hist_missing_pred_s1 = sum(!complete.cases(hist_s1[aoa_vars_s1])),
+    n_hist_missing_pred_s2 = sum(!complete.cases(hist_s2[aoa_vars_s2])),
+    threshold_s1 = aoa_s1$threshold, threshold_s2 = aoa_s2$threshold,
+    aoa_vars_s1 = paste(aoa_vars_s1, collapse = ";"), aoa_vars_s2 = paste(aoa_vars_s2, collapse = ";"),
+    hist_years_available = length(avail), sens_years = paste(sens_years, collapse = ";"),
+    max_train_per_year = max_train_per_year,
+    minutes = as.numeric(difftime(Sys.time(), t0, units = "mins"))
+  )
+  save(meta, "meta")
+  meta
+}
+
+run_flag_safe <- function(flag) {
+  log_line(flag, "start")
+  res <- tryCatch(run_flag(flag), error = function(e) {
+    dir.create(file.path(out_dir, "flags", flag), recursive = TRUE, showWarnings = FALSE)
+    m <- tibble(flag = flag, status = "error", error = conditionMessage(e))
+    qs::qsave(m, file.path(out_dir, "flags", flag, "meta.qs"))
+    m
+  })
+  log_line(flag, res$status, if (!is.na(res$error[1])) res$error[1] else "")
+  res
+}
+```
+
+## Test on flags already checked
+
+Run AUS and CRI first and compare thresholds and effort percentages with the earlier single-flag runs. This confirms that the pixel-year training build matches the original. Set `overwrite = TRUE` if these flags were already run with this script.
+
+```{r test-run, eval=FALSE}
+test <- map_dfr(c("AUS", "CRI"), run_flag_safe)
+test %>% select(flag, status, error, rowcheck_s1, rowcheck_s2, threshold_s1, threshold_s2, minutes)
+
+qs::qread(file.path(out_dir, "flags", "CRI", "aoa_effort.qs")) %>%
+  select(year, pct_effort_s1, pct_effort_s2, pct_effort_both, pct_unassessed) %>%
+  print(n = Inf)
+```
+
+## Run all flags in parallel
+
+`registerDoParallel(cores = )` forks on Linux/macOS, so the large shared objects (`hist_env`, training tables, effort) are not copied to each worker up front. If memory runs short, lower `n_workers`. CHN and USA go first because they take longest. Progress is written to `aoa_log.txt`.
+
+```{r run-all, eval=FALSE}
+########### CHANGE MODEL FLAGS TO REMOVE THE REGIONAL GAPFILLED FLAGS!! ##########
+
+is_done <- function(flag) {
+  f <- file.path(out_dir, "flags", flag, "meta.qs")
+  file.exists(f) && qs::qread(f)$status == "ok"
+}
+todo <- if (overwrite) model_flags else model_flags[!vapply(model_flags, is_done, logical(1))]
+todo <- c(intersect(c("CHN", "USA"), todo), setdiff(todo, c("CHN", "USA")))
+length(todo)
+
+registerDoParallel(cores = n_workers)
+
+run_status <- foreach(flag = todo, .combine = bind_rows, .errorhandling = "pass") %dopar% {
+  run_flag_safe(flag)
+}
+
+stopImplicitCluster()
+
+run_status %>% count(status)
+run_status %>% filter(status != "ok") %>% select(flag, error)
+
+## write code to remove the regional gapfilled flags ##
+```
+
+## Combine: read all flag outputs
+
+Can be run on its own later (after the setup, settings and inputs chunks).
+
+```{r combine-read}
+flag_dirs <- list.dirs(file.path(out_dir, "flags"), recursive = FALSE)
+read_all <- function(name) map_dfr(flag_dirs, \(d) {
+  f <- file.path(d, paste0(name, ".qs"))
+  if (file.exists(f)) qs::qread(f) else NULL
+})
+
+meta_all    <- read_all("meta")
+effort_aoa  <- read_all("aoa_effort")
+di_year_all <- read_all("di_year")
+range_all   <- read_all("range_check")
+strata_all  <- read_all("strata_summary")
+ysens_all   <- read_all("year_sensitivity")
+```
+
+## Checks to review
+
+Failed flags, row-count mismatches against the models' `num.samples`, and historical rows missing predictors after the join.
+
+```{r combine-checks}
+meta_all %>% count(status)
+meta_all %>% filter(status != "ok") %>% select(flag, error)
+
+meta_all %>% filter(status == "ok", !(rowcheck_s1 & rowcheck_s2)) %>%
+  select(flag, starts_with("n_train_s"), starts_with("rowcheck"))
+
+meta_all %>% filter(n_hist_missing_pred_s1 > 0 | n_hist_missing_pred_s2 > 0) %>%
+  select(flag, starts_with("n_hist_missing"))
+```
+
+## Global effort-weighted AOA (headline)
+
+Pooled effort across flags, not an average of flag percentages. `pct_global_effort_covered` = share of ALL industrial effort (including regional-model flags) that was assessed.
+
+```{r combine-global}
+global_total_effort <- effort_all %>% group_by(year) %>% summarise(effort_all_flags = sum(effort))
+
+global_aoa <- effort_aoa %>%
+  group_by(year) %>%
+  summarise(across(c(effort_total, effort_assessed, effort_in_s1, effort_in_s2, effort_in_both), sum),
+            .groups = "drop") %>%
+  left_join(global_total_effort, by = "year") %>%
+  mutate(pct_effort_s1             = 100 * effort_in_s1 / effort_assessed,
+         pct_effort_s2             = 100 * effort_in_s2 / effort_assessed,
+         pct_effort_both           = 100 * effort_in_both / effort_assessed,
+         pct_global_effort_covered = 100 * effort_assessed / effort_all_flags)
+print(global_aoa, n = Inf)
+range(global_aoa$pct_effort_both)
+
+p_global <- global_aoa %>%
+  select(year, `Stage 1` = pct_effort_s1, `Stage 2` = pct_effort_s2, `Both stages` = pct_effort_both) %>%
+  pivot_longer(-year, names_to = "metric", values_to = "pct") %>%
+  ggplot(aes(year, pct, colour = metric)) +
+  geom_line() +
+  scale_y_continuous(limits = c(0, 100)) +
+  labs(x = NULL, y = "% of allocated effort inside AOA", colour = NULL,
+       title = "Industrial, all flag-level models") +
+  theme_bw()
+p_global
+ggsave(file.path(out_dir, "aoa_effort_global.png"), p_global, width = 8, height = 4)
+```
+
+## Per-flag summary
+
+Lowest-coverage flags first.
+
+```{r combine-flags}
+flag_summary <- effort_aoa %>%
+  group_by(flag) %>%
+  summarise(effort_total    = sum(effort_total),
+            pct_effort_both = 100 * sum(effort_in_both) / sum(effort_assessed),
+            min_year_pct    = min(pct_effort_both, na.rm = TRUE),
+            pct_unassessed  = 100 * (sum(effort_total) - sum(effort_assessed)) / sum(effort_total),
+            .groups = "drop") %>%
+  left_join(meta_all %>% select(flag, threshold_s1, threshold_s2, minutes), by = "flag") %>%
+  arrange(pct_effort_both)
+print(flag_summary, n = 20)
+```
+
+## Fleet composition and year sensitivity
+
+```{r combine-strata-year}
+global_strata <- strata_all %>%
+  group_by(year) %>%
+  summarise(pct_effort_unseen_strata = 100 * sum(effort_unseen) / sum(effort_total))
+print(global_strata, n = Inf)
+
+ysens_summary <- ysens_all %>%
+  filter(!is.na(stage)) %>%
+  pivot_longer(starts_with("y"), names_to = "year_set", values_to = "rho") %>%
+  group_by(stage, year_set) %>%
+  summarise(n = sum(!is.na(rho)), median_rho = median(rho, na.rm = TRUE),
+            p10_rho = quantile(rho, 0.1, na.rm = TRUE), min_rho = min(rho, na.rm = TRUE), .groups = "drop")
+ysens_summary
+```
+
+## Save combined outputs
+
+```{r combine-save}
+combined <- list(meta = meta_all, global_aoa = global_aoa, flag_summary = flag_summary,
+                 effort_aoa = effort_aoa, di_year = di_year_all, range_check = range_all,
+                 global_strata = global_strata, strata_summary = strata_all,
+                 year_sensitivity = ysens_all, ysens_summary = ysens_summary)
+qs::qsave(combined, file.path(out_dir, "aoa_industrial_combined.qs"))
+
+iwalk(combined[c("global_aoa", "flag_summary", "global_strata", "ysens_summary", "meta")],
+      \(x, nm) write_csv(x, file.path(out_dir, glue("{nm}.csv"))))
+```

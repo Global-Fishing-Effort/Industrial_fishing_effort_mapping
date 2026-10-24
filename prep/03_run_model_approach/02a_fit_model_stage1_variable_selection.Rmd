@@ -200,7 +200,7 @@ flags <- setdiff(flags, missing_flags) # 147 flags to run now
 
 # done_flags <- unique(str_after_last(str_before_last(list.files(file.path(rdsi_dir, "prep/random_forest/stage_1_models/pruning/")), "_"), "_"))
 
-flags_to_run <- unique(c("CHN", "USA", "CAN", "CHL", "AUS", "NOR", setdiff(flags, "HND"))) # add any flags we've already run
+flags_to_run <- unique(c("CHN", "USA", "CAN", "CHL", "AUS", "NOR", flags)) # add any flags we've already run
 
 # Set up parallel backend
 num_cores <- 28
@@ -480,11 +480,11 @@ stage_1_flags_done <- unique(sub(".*stage_1_rf_model_full_data_([A-Z]{3})_.*", "
 
 flags_to_run <- setdiff(stage_1_flags, stage_1_flags_done)
 
-# stage_1_flags <- unique(c("CHN", "USA", "TWN", "CAN", "JPN", "ESP", "KOR", "RUS", "CHL", "AUS", "NOR", "GBR", stage_1_flags)) # move CHN and USA to the front of the list since they take the longest to run...
+# flags_to_run <- unique(c("CHN", "USA", "TWN", "CAN", "JPN", "ESP", "KOR", "RUS", "CHL", "AUS", "NOR", "GBR", stage_1_flags)) # move CHN and USA to the front of the list since they take the longest to run...
 
-# flags_to_run <- unique(c("CHN", "USA", "TWN", "CAN", "JPN", "ESP", "KOR", "RUS", "NOR", "GBR", flags_to_run)) # move CHN and USA to the front of the list since they take the longest to run...
 
-num_cores <- 20
+
+num_cores <- 16
 cl <- makeCluster(num_cores)
 registerDoParallel(cl)
 
@@ -555,3 +555,8 @@ stopCluster(cl)
  
 
 ```
+
+```{r}
+
+```
+

@@ -63,9 +63,9 @@ model_data <- readRDS(here("data/model_features/prepared_regional_data_1deg.rds"
 
   global_grid <- read.csv(here("data/model_features/deg_1_x_1/global_grid.csv"))
   
-  ocean_data <- read.csv(here("data/model_features/deg_1_x_1/errdap_chl.csv")) %>%
-  left_join(read.csv(here("data/model_features/deg_1_x_1/errdap_sst.csv")), by = c("pixel_id", "year")) %>% 
-  left_join(read.csv(here("data/model_features/deg_1_x_1/remss_wind.csv")), by = c("pixel_id", "year")) %>%
+  ocean_data <- qread(here("data/model_features/deg_1_x_1/errdap_chl.qs")) %>%
+  left_join(qread(here("data/model_features/deg_1_x_1/errdap_sst.qs")), by = c("pixel_id", "year")) %>% 
+  left_join(qread(here("data/model_features/deg_1_x_1/remss_wind.qs")), by = c("pixel_id", "year")) %>%
   filter(year %in% c(2015:2024)) 
 
 
@@ -79,12 +79,12 @@ model_data <- readRDS(here("data/model_features/prepared_regional_data_1deg.rds"
    crossing(., year = c(2015:2024)) 
   
       
-  mpa_data <- qs::qread(here("data/model_features/deg_1_x_1/mpa/mpa_data_all.qs")) %>%
-    filter(year >= 2015)
+  # mpa_data <- qs::qread(here("data/model_features/deg_1_x_1/mpa/mpa_data_all.qs")) %>%
+   #  filter(year >= 2015)
   
   env_data <- spatial_data %>%
     left_join(ocean_data) %>% # cool.
-    left_join(mpa_data) %>%
+   # left_join(mpa_data) %>%
     dplyr::select(-geometry_wkt) %>%
     left_join(elnino) %>%
     left_join(pdo) %>%
@@ -143,9 +143,10 @@ model_formula_rf <- formula(
     nearest_seamount_distance_m + 
     year +
     ais_reception_positions_per_day_class_A +
-    ais_reception_positions_per_day_class_B + 
-    nearest_mpa_distance_m + 
-    nearest_mpa_years_since_designation
+    ais_reception_positions_per_day_class_B
+  # + 
+  #   nearest_mpa_distance_m + 
+  #   nearest_mpa_years_since_designation
 )
   
 env_grid <- env_data %>% 
@@ -549,6 +550,11 @@ qs::qsave(model, glue(file.path(rdsi_dir, "prep/random_forest/stage_2_models_reg
 
 stopCluster(cl)
 
+
+```
+
+
+```{r}
 
 ```
 

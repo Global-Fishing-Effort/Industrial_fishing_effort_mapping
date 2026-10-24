@@ -81,6 +81,7 @@ data_grid <- data.table::fread(here::here("data/model_features/deg_1_x_1/global_
 Prep 1982-2024 SST, 2003-2024 CHL, data, and save
 
 ```{r}
+
 # Spatially aggregate SST and SST anomaly data
 spatially_aggregate_errdap_data_wrapper(dataset_name = "ncdcOisst21Agg_LonPM180",
                                         spatial_aggregation = data_grid,
