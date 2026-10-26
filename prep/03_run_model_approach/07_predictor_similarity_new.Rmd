@@ -82,7 +82,9 @@ dir.create(file.path(out_dir, "flags"), recursive = TRUE, showWarnings = FALSE)
 log_file <- file.path(out_dir, "aoa_log.txt")
 
 # flags allocated with regional gap-fill models (not assessed)
-regional_flags <- c()   # fill in from your gap-filling script
+regional_flags <- c("BEN", "BGD", "BHS", "BLZ", "BRN", "COD", "COG", "CUB", "DJI", "DOM", "GAB", "GLP", "GMB", "GNB",
+                "GNQ", "GTM", "GUF", "GUY", "HND", "IRQ", "JAM", "KWT", "LBN", "LCA", "MDG", "MNE", "MYT", "RAA",
+                "RAM", "ROU", "STP", "SUR", "SVN", "SYR", "TGO", "TON", "WLF")   # fill in from your gap-filling script
 
 excl_vars <- c("year",
                "ais_reception_positions_per_day_class_A",
@@ -90,6 +92,11 @@ excl_vars <- c("year",
                "gear", "length_category",
                "eez_id", "fao_id", "meso_id", "ocean",
                "eez_region_world_bank_7", "gov_score")
+
+regional_flags <- c("BEN", "BGD", "BHS", "BLZ", "BRN", "COD", "COG", "CUB", "DJI", "DOM", "GAB", "GLP", "GMB", "GNB",
+                    "GNQ", "GTM", "GUF", "GUY", "HND", "IRQ", "JAM", "KWT", "LBN", "LCA", "MDG", "MNE", "MYT", "RAA",
+                    "RAM", "ROU", "STP", "SUR", "SVN", "SYR", "TGO", "TON", "WLF")
+
 ```
 
 ## Load the training and prediction data
@@ -564,7 +571,6 @@ qs::qread(file.path(out_dir, "flags", "CRI", "aoa_effort.qs")) %>%
 `registerDoParallel(cores = )` forks on Linux/macOS, so the large shared objects (`hist_env`, training tables, effort) are not copied to each worker up front. If memory runs short, lower `n_workers`. CHN and USA go first because they take longest. Progress is written to `aoa_log.txt`.
 
 ```{r run-all, eval=FALSE}
-########### CHANGE MODEL FLAGS TO REMOVE THE REGIONAL GAPFILLED FLAGS!! ##########
 
 is_done <- function(flag) {
   f <- file.path(out_dir, "flags", flag, "meta.qs")
