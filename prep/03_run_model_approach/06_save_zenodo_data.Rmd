@@ -234,7 +234,6 @@ missing_data <- hist_fish_data %>%
   filter(proportion_hours_modeled != 1) %>%
   filter(proportion_hours_modeled < 0.9999) # should be 0 after our gapfilling. It is, so we actually do not need to save this file anymore. 
 
-## why is cuba <6m 2017 missing??
  
 # fwrite(hist_fish_data, file.path(rdsi_dir, "prep/random_forest/zenodo_data/known_industrial_effort_rousseau.csv"), row.names = FALSE) 
 
