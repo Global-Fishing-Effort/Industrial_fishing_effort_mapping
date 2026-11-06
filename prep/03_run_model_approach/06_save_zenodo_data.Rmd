@@ -35,6 +35,12 @@ data_grid_area <- global_grid %>%
   mutate(pixel_area_m2 = st_area(geometry_wkt)%>%
            units::drop_units()) 
 
+data_grid_km2 <- data_grid_area %>%
+  st_drop_geometry() %>%
+  mutate(pixel_area_km2 = pixel_area_m2/1000000) %>%
+  dplyr::select(lon, lat, pixel_area_km2) %>% 
+    distinct()
+
 ```
 
 
@@ -65,13 +71,13 @@ low_sample_flags <- readRDS(here("data/model_features/prepared_data_1deg.rds")) 
   filter(n_obs < 100) %>%
   pull(flag_fin) %>%
   unique()
-                
+               
 
 cl <- makeCluster(24)  # could probably increase this? 
 registerDoParallel(cl)
 
 foreach(flag = all_flags, .packages = c("qs", "dplyr", "tidyverse", "glue", "countrycode", "data.table")) %dopar% {
-  # flag = "GAB"
+  # flag = "BRB"
   
   
   all_files_flag_original <- list.files(file.path(rdsi_dir, "prep/random_forest/predictions_industrial_flag_revised_floor_depth/"), pattern = flag, full.names = TRUE)
@@ -129,6 +135,8 @@ if(nrow(all_data_flag_regional_gf) == 0){
   all_data_fin <- all_data_flag_original %>%
     filter(nom_active_fishing_hours > 0) %>%
     rbind(data_to_add) %>%
+        mutate(gear = as.character(gear),
+               flag_country_iso3c = as.character(flag_country_iso3c)) %>%
     mutate(flag_country_name = case_when(
       flag_country_iso3c == "RAA" ~ "Azores", 
       flag_country_iso3c == "RAM" ~ "Madeira", 
@@ -138,10 +146,28 @@ if(nrow(all_data_flag_regional_gf) == 0){
     )) %>%
     dplyr::select(-pixel_area_m2, -pixel_id, -eff_days_km2, -eff_hours_km2, -nom_days_km2, -nom_hours_km2, -nv_km2)
   
-
+  all_data_trawl_split <- all_data_fin %>%
+    filter(gear %in% c("Trawl_Bottom", "Trawl_Midwater_or_Unsp"))
   
-  fwrite(all_data_fin, file.path(rdsi_dir, glue("prep/random_forest/zenodo_data/mapped_by_flag_country_industrial/model_preds_1950_2017_{flag}.csv")))
-}
+  if(nrow(all_data_trawl_split) != 0){
+  
+  fwrite(all_data_trawl_split, file.path(rdsi_dir, glue("prep/random_forest/zenodo_data/mapped_by_flag_country_industrial_trawl_split/ind_trawl_split_1950_2017_{flag}.csv")))
+  }
+
+  all_data_fin_fin <- all_data_fin %>%
+    mutate(gear = ifelse(gear %in% c("Trawl_Bottom", "Trawl_Midwater_or_Unsp"), "Trawlers", gear)) %>%
+    group_by(lon, lat, year, flag_country_iso3c, flag_country_name, gear, length_category, eez_sovereign_iso3c, eez_sovereign_name, fao_fishing_id, fao_major_fishing_area, sector, data_type) %>%
+    summarise(nom_active_fishing_hours = sum(nom_active_fishing_hours, na.rm = TRUE),
+              eff_active_fishing_hours = sum(eff_active_fishing_hours, na.rm = TRUE),
+              nom_active_fishing_days = sum(nom_active_fishing_days, na.rm = TRUE),
+              eff_active_fishing_days = sum(eff_active_fishing_days, na.rm = TRUE),
+              nv = sum(nv, na.rm = TRUE)
+              ) %>%
+    left_join(data_grid_km2)
+  
+  fwrite(all_data_fin_fin, file.path(rdsi_dir, glue("prep/random_forest/zenodo_data/mapped_by_flag_country_industrial/model_preds_1950_2017_{flag}.csv")))
+
+  }
 
 stopCluster(cl)
 
@@ -178,6 +204,16 @@ all_data_grouped <- all_data %>%
 
 fwrite(all_data_grouped, file.path(rdsi_dir, "prep/random_forest/zenodo_data/industrial_effort_predictions_by_flag_eez_fao_gear_length_1950_2017.csv"), row.names = FALSE)
 
+## save as one split trawling csv
+
+  all_files_flag_trawl <- list.files(file.path(rdsi_dir, "prep/random_forest/zenodo_data/mapped_by_flag_country_industrial_trawl_split/"), full.names = TRUE)
+
+    all_data_trawl <- lapply(all_files_flag_trawl, fread) %>%
+      bind_rows()
+
+fwrite(all_data_trawl, file.path(rdsi_dir, "prep/random_forest/zenodo_data/mapped_industrial_split_trawling_effort_1950_2017.csv"), row.names = FALSE)
+
+# zip mapped_industrial_split_trawling_effort_1950_2017.zip mapped_industrial_split_trawling_effort_1950_2017.csv
 ```
 
 
@@ -205,6 +241,7 @@ all_data_grouped_2 <- all_data_grouped %>%
 hist_fish_data <- qs::qread(here("data/int/rousseau_gear_fix.qs")) %>%
     ## remove artisanal
     filter(sector == "I") %>%
+    mutate(gear_new = ifelse(gear_new %in% c("Trawl_Midwater_or_Unsp", "Trawl_Bottom"), "Trawlers", gear_new)) %>%
     group_by(year, flag_fin = country, gear = gear_new, length_category) %>%
     summarize(
       total_nominal_fishing_hours = sum(nom_active_hours, na.rm = TRUE),
@@ -255,7 +292,7 @@ gapfill_df <- all_data_grouped %>%
   janitor::clean_names() %>%
 mutate(across(everything(), ~ ifelse(is.na(.), 0, .)))
 
-sum(gapfill_df$regional_model)/sum(all_data_grouped$nom_active_fishing_hours) # 0.0007769694 less than 1% of total effort
+sum(gapfill_df$regional_model)/sum(all_data_grouped$nom_active_fishing_hours) # 0.001066751 less than 1% of total effort = 0.1%
 
 gapfill_df %>% filter(year == 2017) %>% pull(regional_model) %>% sum()/sum(all_data_grouped$nom_active_fishing_hours)
 
@@ -314,12 +351,6 @@ test_chn2 <- qread(file.path(rdsi_dir, "prep/random_forest/predictions_flag_no_a
    sum() # 7141969
  # perfect
  
-# Industrial notes:
- 
-# VNM too sparse now
-# IDN going back in time
-# IND going back in time? 
-# Thailand in general 
 
  
  

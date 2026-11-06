@@ -357,7 +357,7 @@ eez_cells <- stage1_preds %>%
 # test <- eez_cells %>%
 #   distinct(pixel_id)
 
-eez_cells_distinct <- env_data_loop %>%
+eez_cells_distinct <- env_data_fishing_areas %>%
   filter(eez_sovereign == flag) %>%
   distinct(pixel_id, lon, lat)
 
@@ -381,7 +381,7 @@ eez_cells_thresh <- stage1_preds %>%
 n_thresh <- nrow(eez_cells_thresh %>% distinct(lon, lat))
 
 # decide whether to use threshold rule or fallback top-K rule
-if (n_thresh < k_min) { # if we have less rows from our cutoff with 99th quantile than our minimum, we will select the top k_min cells to keep. This will really only happen for countries with really small EEZs that do not predict well, or countries that just do not predict well/have a lot of AIS
+if (n_thresh < k_min) { # if we have less rows from our cutoff than our minimum, we will select the top k_min cells to keep. This will really only happen for countries with really small EEZs that do not predict well, or countries that just do not predict well/have a lot of AIS
   
   K_ref <- ceiling(0.3 * N_accessible)
   
@@ -526,7 +526,7 @@ all_n_ref_data <- lapply(files, qread) %>%
 n_ref_group <- all_n_ref_data %>%
   group_by(flag_fin) %>%
   summarise(n_ref = n()) %>%
-  ungroup() # should be 147 - why is this only 131? Because some countries do not have predictions within their EEZ for 2015-2017 (lack of data). These will be gapfilled with the regional gapfilling? 
+  ungroup() # should be 147 - why is this only 133? Because some countries do not have predictions within their EEZ for 2015-2017 (lack of data). These will be gapfilled with the regional gapfilling? 
 
 test <- qread(file.path(rdsi_dir, "prep/random_forest/eez_2015_2017_reference_cells_0/access_mask_2015_2017_BEN.qs"))
 test <- qread(file.path(rdsi_dir, "prep/random_forest/predictions_all/yearly/model_preds_BEN_2017.qs")) # doesn't have any non zero predictions in BEN EEZ. Will use regional preds instead
@@ -599,14 +599,12 @@ eff_ref_df <- hist_fish_data %>%
   summarise(eff_year = sum(total_nominal_fishing_hours, na.rm = TRUE)) %>%
   ungroup() 
 
-eez_size_df <- env_data_loop %>%
+eez_size_df <- env_data_fishing_areas %>%
   filter(eez_sovereign != "High seas") %>%
   distinct(pixel_id, lon, lat, eez_sovereign) %>%
   group_by(flag_fin = eez_sovereign) %>%
     summarise(n_cells_eez = n()) %>%
     ungroup()
-
-
 
 # calculate floor based on limit of 20m of depth per EEZ
 
@@ -642,6 +640,105 @@ n_year_total_df <- eff_ref_df %>%
 
 ```
 
+Do some diagonistics for the MS 
+
+```{r}
+## ---- Diagnostics: which constraint sets the domestic cell count each flag-year? ----
+
+# 1. Keep both parts of the floor so we can tell which one wins
+#    (same filters as depth_floor_df above)
+floor_parts_df <- env_data_fishing_areas %>%
+  filter(eez_sovereign != "High seas") %>%
+  distinct(pixel_id, flag_fin = eez_sovereign, elevation_m) %>%
+  group_by(flag_fin) %>%
+  summarise(n_cells_depth = sum(elevation_m >= -200, na.rm = TRUE), .groups = "drop") %>%
+  right_join(eez_size_df, by = "flag_fin") %>%
+  mutate(n_cells_depth  = coalesce(n_cells_depth, 0L),
+         n_cells_eez_10 = ceiling(0.1 * n_cells_eez),
+         floor_source   = if_else(n_cells_depth >= n_cells_eez_10, "Shelf (<=200 m)", "10% of EEZ")) %>%
+  dplyr::select(flag_fin, n_cells_depth, n_cells_eez_10, floor_source)
+
+# 2. Was N_ref itself set by p > 0 or by the 30%-of-EEZ fallback?
+n_ref_source <- all_n_ref_data %>%
+  distinct(flag_fin, n_ref_rule = limit_type)
+
+# 3. Label each flag-year by the constraint that set n_year_total_depth
+limit_diag <- n_year_total_df %>%
+  filter(year %in% 1950:2017) %>%
+  left_join(floor_parts_df, by = "flag_fin") %>%
+  left_join(n_ref_source, by = "flag_fin") %>%
+  mutate(
+    floor_binds = n_cells_depth_constraint > n_year_total_fin,  # floor raised the effort-scaled value
+    binding = case_when(
+      floor_binds & n_cells_depth_constraint >= n_ref ~ "Floor >= N_ref (held at N_ref)",
+      floor_binds                                      ~ paste0("Floor: ", floor_source),
+      n_year_total_1 >= n_ref                          ~ "N_ref cap",
+      TRUE                                             ~ "Effort scaling (between limits)"
+    )
+  )
+
+# sanity check: the label should reproduce the value actually used
+stopifnot(with(limit_diag, all(
+  n_year_total_depth == case_when(
+    binding == "Floor >= N_ref (held at N_ref)" ~ n_ref,
+    startsWith(binding, "Floor: ")              ~ n_cells_depth_constraint,
+    binding == "N_ref cap"                      ~ n_ref,
+    TRUE                                        ~ n_year_total_fin))))
+
+# 4. Per-flag summary
+flag_summary <- limit_diag %>%
+  group_by(flag_fin, n_ref_rule, floor_source, n_ref, n_cells_eez,
+           n_cells_depth, n_cells_eez_10, n_cells_depth_constraint) %>%
+  summarise(
+    n_years            = n(),
+    yrs_at_cap         = sum(binding == "N_ref cap"),
+    yrs_floor          = sum(startsWith(binding, "Floor: ")),
+    yrs_floor_ge_nref  = sum(binding == "Floor >= N_ref (held at N_ref)"),
+    yrs_effort_scaled  = sum(binding == "Effort scaling (between limits)"),
+    latest_floor_year  = suppressWarnings(max(year[floor_binds])),  # -Inf if never
+    .groups = "drop"
+  ) %>%
+  mutate(floor_ge_nref = n_cells_depth_constraint >= n_ref)
+
+# 5. Headline numbers (flags)
+flag_summary %>%
+  summarise(
+    n_flags                  = n(),
+    n_ref_from_30pct_fallback = sum(n_ref_rule == "30% of EEZ", na.rm = TRUE),
+    ever_at_n_ref_cap        = sum(yrs_at_cap > 0),
+    ever_floor_binds         = sum(yrs_floor + yrs_floor_ge_nref > 0),
+    floor_binds_via_shelf    = sum(yrs_floor + yrs_floor_ge_nref > 0 & floor_source == "Shelf (<=200 m)"),
+    floor_binds_via_10pct    = sum(yrs_floor + yrs_floor_ge_nref > 0 & floor_source == "10% of EEZ"),
+    floor_ge_n_ref_no_contraction = sum(floor_ge_nref)
+  )
+
+# 6. Headline numbers (flag-years)
+limit_diag %>%
+  count(binding) %>%
+  mutate(pct = round(100 * n / sum(n), 1))
+
+# 7. How the binding constraint shifts through time
+limit_diag %>%
+  count(year, binding) %>%
+  ggplot(aes(year, n, fill = binding)) +
+  geom_area() +
+  labs(x = NULL, y = "Number of flags", fill = "Constraint setting N_year,total") +
+  theme_minimal()
+
+# flags whose floor is >= N_ref, so their domestic footprint never contracts
+flag_summary %>% filter(floor_ge_nref) %>% arrange(desc(n_cells_depth_constraint / n_ref))
+
+limit_diag %>%
+  filter(binding == "N_ref cap", !year %in% 2015:2017) %>%
+  mutate(region = countrycode(flag_fin, "iso3c", "region")) %>%
+  count(region, sort = TRUE)
+
+limit_diag %>% filter(binding == "N_ref cap", !year %in% 2015:2017) %>% nrow()
+
+flag_summary %>% filter(floor_ge_nref) %>% mutate(shelf_share = n_cells_depth / n_cells_eez)
+```
+
+
 
 Now we can rank the p>0 predictions and limit them n_year_total_fin by selecting the top n_year_total probability values. 
 
@@ -665,7 +762,8 @@ tasks <- tasks[!file.exists(out_file)]
 data_to_run <- hist_fish_data %>%
   distinct(flag_fin, year) %>%
   left_join(tasks, by = c("year", "flag_fin" = "flag")) %>%
-  filter(!is.na(out_file))
+  filter(!is.na(out_file)) %>%
+  filter(flag_fin %in% unique(n_year_total_df$flag_fin))
 
 flags_to_run <- unique(data_to_run$flag_fin) 
 years_to_run <- unique(data_to_run$year) 
@@ -787,7 +885,7 @@ stopCluster(cl)
 
 pred_path <- file.path(rdsi_dir, "prep/random_forest/predictions_industrial_flag_revised_floor_depth/yearly/")
 pred_files <- list.files(pred_path, full.names = TRUE)
-pred_flags <- unique(sub(".*model_preds_([A-Z]{3})_.*", "\\1", pred_files)) # should be 131 - good
+pred_flags <- unique(sub(".*model_preds_([A-Z]{3})_.*", "\\1", pred_files)) # should be 133 - good
 
 length(unique(n_year_total_df$flag_fin)) == length(pred_flags) # TRUE - good
 
